@@ -1,40 +1,34 @@
-// window.h
-#ifndef WINDOW_H
-#define WINDOW_H
+#ifndef SIMP_WINDOW_H
+#define SIMP_WINDOW_H
+
+#include <vector>
 
 #include <windows.h>
-#include <cstdint>
-
-enum class RendererType
-{
-    VULKAN,
-    DIRECTX
-};
 
 struct DisplayInfo
 {
-    int number;
-    RECT bounds;
-    bool isPrimary;
+    int number = 0;
+    RECT bounds{};
+    RECT workArea{};
+    bool isPrimary = false;
 };
 
 extern HWND g_hwnd;
-extern float scaleFactor;
 extern bool g_menuActive;
 
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam);
-BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData);
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+BOOL CALLBACK MonitorEnumProc(HMONITOR monitor, HDC monitorDc, LPRECT monitorRect, LPARAM userData);
 
-void initHandlers();
-void initWindow();
-void renderFrame();
+void initWindow(HINSTANCE instance, bool showWindowNow = true);
+void showMainWindow();
 bool processEvents();
-void toggleFullscreen();
-int getDisplayRefreshRate();
+bool shouldRender();
+void renderFrame();
 void cleanupWindow();
+void requestRender();
 void setMinimumClientSize(int minClientWidth, int minClientHeight);
-void resizeContentTexture(uint32_t width, uint32_t height);
-int getDisplayRefreshRate();
+void updateConfigFromWindow();
+RECT getPreferredMonitorBounds();
+void toggleFullscreen();
 
-#endif // WINDOW_H
+#endif

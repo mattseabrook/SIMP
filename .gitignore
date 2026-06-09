@@ -18,6 +18,7 @@
 mono_crash.*
 
 # Build results
+[Bb]uild/
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
@@ -126,6 +127,10 @@ ipch/
 *.cachefile
 *.VC.db
 *.VC.VC.opendb
+
+# SIMP build outputs
+simp.exe
+simp-debug.exe
 
 # Visual Studio profiler
 *.psess

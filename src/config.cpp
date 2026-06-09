@@ -1,87 +1,139 @@
-// config.cpp
-
 #include "config.h"
 #include "window.h"
-#include "game.h"
 
+#include <algorithm>
 #include <fstream>
-#include <filesystem>
+#include <iomanip>
+#include <stdexcept>
+
 #include <windows.h>
 
 nlohmann::json config;
-std::string windowTitle = "Phantom Engine";
+std::string windowTitle = "SIMP";
+const int DEFAULT_CLIENT_WIDTH = 1600;
+const int DEFAULT_CLIENT_HEIGHT = 900;
 const int MIN_CLIENT_WIDTH = 1280;
 const int MIN_CLIENT_HEIGHT = 720;
-const int CONTENT_WIDTH = 1920;   // PVX video content resolution
-const int CONTENT_HEIGHT = 1080;
 
-//
-// Load configuration from file
-//
-void load_config(const std::string &filename)
+namespace
 {
-	if (!std::filesystem::exists(filename))
-	{
-		std::ofstream config_file(filename);
-		if (config_file.is_open())
-		{
-			config_file << default_config;
-		}
-	}
-
-	std::ifstream config_file(filename);
-	if (config_file.is_open())
-	{
-		config_file >> config;
-	}
-	else
-	{
-		throw std::runtime_error("Failed to open configuration file: " + filename);
-	}
+nlohmann::json makeDefaultConfig()
+{
+    return {
+        {"renderer", "VULKAN"},
+        {"fullscreen", false},
+        {"maximized", false},
+        {"display", 1},
+        {"x", 96},
+        {"y", 96},
+        {"width", DEFAULT_CLIENT_WIDTH},
+        {"height", DEFAULT_CLIENT_HEIGHT}
+    };
 }
 
-//
-// Save configuration to file
-//
-void save_config(const std::string &filename)
+std::filesystem::path getExecutableDirectory()
 {
-	if (g_hwnd)
-	{
-		RECT windowRect;
-		GetWindowRect(g_hwnd, &windowRect);
-		HMONITOR hMonitor = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
-		MONITORINFOEX monitorInfo = {};
-		monitorInfo.cbSize = sizeof(MONITORINFOEX);
-		if (GetMonitorInfo(hMonitor, &monitorInfo))
-		{
-			state.ui.x = windowRect.left - monitorInfo.rcMonitor.left;
-			state.ui.y = windowRect.top - monitorInfo.rcMonitor.top;
+    wchar_t buffer[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return std::filesystem::current_path();
+    return std::filesystem::path(buffer).parent_path();
+}
 
-			if (!config["fullscreen"].get<bool>())
-			{
-				RECT clientRect;
-				GetClientRect(g_hwnd, &clientRect);
-				config["width"] = clientRect.right - clientRect.left;
-				config["x"] = state.ui.x;
-				config["y"] = state.ui.y;
-			}
+template <typename T>
+void assignOrDefault(const char* key, const T& defaultValue)
+{
+    if (!config.contains(key) || config[key].is_null())
+        config[key] = defaultValue;
+}
 
-			for (const auto &display : state.ui.displays)
-				if (EqualRect(&display.bounds, &monitorInfo.rcMonitor))
-				{
-					config["display"] = display.number;
-					break;
-				}
-		}
-	}
+void sanitizeConfig()
+{
+    if (!config.is_object())
+        config = makeDefaultConfig();
 
-	std::ofstream config_file(filename);
-	if (config_file.is_open())
-	{
-		config_file << std::setw(4) << config << std::endl;
-	}
-	else
-	{
-		throw std::runtime_error("Failed to save configuration file: " + filename);
-	}
+    assignOrDefault("renderer", std::string("VULKAN"));
+    assignOrDefault("fullscreen", false);
+    assignOrDefault("maximized", false);
+    assignOrDefault("display", 1);
+    assignOrDefault("x", 96);
+    assignOrDefault("y", 96);
+    assignOrDefault("width", DEFAULT_CLIENT_WIDTH);
+    assignOrDefault("height", DEFAULT_CLIENT_HEIGHT);
+
+    if (!config["renderer"].is_string())
+        config["renderer"] = "VULKAN";
+    if (!config["fullscreen"].is_boolean())
+        config["fullscreen"] = false;
+    if (!config["maximized"].is_boolean())
+        config["maximized"] = false;
+    if (!config["display"].is_number_integer())
+        config["display"] = 1;
+    if (!config["x"].is_number_integer())
+        config["x"] = 96;
+    if (!config["y"].is_number_integer())
+        config["y"] = 96;
+    if (!config["width"].is_number_integer())
+        config["width"] = DEFAULT_CLIENT_WIDTH;
+    if (!config["height"].is_number_integer())
+        config["height"] = DEFAULT_CLIENT_HEIGHT;
+
+    config["renderer"] = "VULKAN";
+    config["display"] = std::max(1, config["display"].get<int>());
+    config["width"] = std::max(MIN_CLIENT_WIDTH, config["width"].get<int>());
+    config["height"] = std::max(MIN_CLIENT_HEIGHT, config["height"].get<int>());
+}
+}
+
+std::filesystem::path getConfigPath()
+{
+    return getExecutableDirectory() / "config.json";
+}
+
+void load_config(const std::filesystem::path& filename)
+{
+    config = makeDefaultConfig();
+
+    bool shouldRewrite = false;
+    if (std::filesystem::exists(filename))
+    {
+        try
+        {
+            std::ifstream input(filename);
+            if (!input.is_open())
+                throw std::runtime_error("failed to open config file");
+
+            nlohmann::json loaded;
+            input >> loaded;
+            if (loaded.is_object())
+                config.merge_patch(loaded);
+            else
+                shouldRewrite = true;
+        }
+        catch (...)
+        {
+            shouldRewrite = true;
+        }
+    }
+    else
+    {
+        shouldRewrite = true;
+    }
+
+    sanitizeConfig();
+
+    if (shouldRewrite)
+        save_config(filename);
+}
+
+void save_config(const std::filesystem::path& filename)
+{
+    updateConfigFromWindow();
+    sanitizeConfig();
+
+    std::ofstream output(filename);
+    if (!output.is_open())
+        throw std::runtime_error("Failed to save configuration file: " + filename.string());
+
+    output << std::setw(4) << config << '\n';
 }

@@ -1,21 +1,19 @@
-// menu.h
-
-#ifndef MENU_H
-#define MENU_H
+#ifndef SIMP_MENU_H
+#define SIMP_MENU_H
 
 #include <windows.h>
 
-enum class MenuCommands
+enum MenuCommand : UINT
 {
-    MC_FILE_OPEN = 1,
-    MC_FILE_SAVE,
-    MC_FILE_EXIT,
-    MC_HELP_ABOUT
+    IDM_FILE_OPEN = 40001,
+    IDM_FILE_EXIT = 40002,
+    IDM_VIEW_GRID = 40003,
+    IDM_VIEW_RULERS = 40004,
+    IDM_HELP_ABOUT = 40005
 };
 
-//=============================================================================
-
 void initMenu(HWND hwnd);
-LRESULT HandleMenuCommand(HWND hwnd, WPARAM wParam);
+LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam);
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 
-#endif // MENU_H
+#endif

@@ -1,0 +1,8 @@
+#ifndef SIMP_RESOURCE_H
+#define SIMP_RESOURCE_H
+
+#define IDD_ABOUT_DIALOG 101
+#define IDC_ABOUT_TEXT 102
+#define IDR_SPLASH_FRAME_FIRST 1000
+
+#endif

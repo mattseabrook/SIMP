@@ -1,963 +1,944 @@
-// system.cpp
+#include "system.h"
 
-#include <windows.h>
-#include <intrin.h>
-#include <string>
-#include <cstdio>
-#include <cstring>
-#include <set>
-#include <algorithm>
-#include <cstdlib>
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
-// No PNG dependency - using BMP format with Windows GDI
+#include "config.h"
 
 #include "../resource.h"
-#include "system.h"
-#include "config.h"
-#include "window.h"
-#include "game.h"
 
-// Forward declaration of window procedure
-LRESULT CALLBACK SystemInfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <cwchar>
+#include <filesystem>
+#include <mutex>
+#include <process.h>
+#include <string>
+#include <string_view>
+#include <utility>
 
-unsigned char* LoadImageFromResource(int resourceID, int* width, int* height, int* channels)
+#include <dwmapi.h>
+#include <shellapi.h>
+#include <wincodec.h>
+#include <windowsx.h>
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+
+namespace
 {
-    char buf[256];
-    HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(resourceID), RT_RCDATA);
-    if (!hRes) {
-        snprintf(buf, sizeof(buf), "[System] FindResource failed for ID %d, error: %lu\n", resourceID, GetLastError());
-        OutputDebugStringA(buf);
-        return nullptr;
-    }
+constexpr UINT kSplashTimerId = 1;
+constexpr UINT kSplashFrameIntervalMs = 1000 / 30;
+constexpr UINT kSplashFrameReadyMessage = WM_APP + 18;
+constexpr int kSplashHorizontalPadding = 72;
+constexpr int kSplashTextBlockAnchorYPercent = 80;
+constexpr DWORD kDwmColorDefault = 0xFFFFFFFFu;
+const wchar_t* kSplashWindowClassName = L"SimpSplashWindowClass";
+constexpr wchar_t kSplashAuthorUrl[] = L"https://www.mattseabrook.net";
+constexpr std::array<std::wstring_view, 4> kSplashTitleWords = {
+    L"Simple",
+    L"Image",
+    L"Manipulation",
+    L"Program"
+};
+constexpr std::wstring_view kSplashAuthorName = L"Matt Seabrook";
 
-    HGLOBAL hMem = LoadResource(NULL, hRes);
-    if (!hMem) {
-        snprintf(buf, sizeof(buf), "[System] LoadResource failed, error: %lu\n", GetLastError());
-        OutputDebugStringA(buf);
-        return nullptr;
-    }
+IWICImagingFactory* g_wicFactory = nullptr;
+bool g_comInitialized = false;
+ThemePalette g_themePalette;
+HWND g_splashWindow = nullptr;
 
-    void* data = LockResource(hMem);
-    DWORD size = SizeofResource(NULL, hRes);
-
-    if (!data || size == 0) {
-        OutputDebugStringA("[System] LockResource failed or size is 0\n");
-        return nullptr;
-    }
-
-    snprintf(buf, sizeof(buf), "[System] Resource ID %d loaded: %lu bytes\n", resourceID, size);
-    OutputDebugStringA(buf);
-
-    unsigned char* result = stbi_load_from_memory((const stbi_uc*)data, size, width, height, channels, 4); // Force 4 channels (RGBA)
-    
-    if (!result) {
-        snprintf(buf, sizeof(buf), "[System] stbi_load_from_memory failed: %s\n", stbi_failure_reason());
-        OutputDebugStringA(buf);
-    } else {
-        snprintf(buf, sizeof(buf), "[System] Image decoded: %dx%d %d channels\n", *width, *height, *channels);
-        OutputDebugStringA(buf);
-    }
-    
-    return result;
-}
-
-static std::string resolvePathFromModuleDir(const char* path)
+template <typename T>
+void safeRelease(T*& value)
 {
-    if (!path || !*path)
-        return std::string();
-
-    std::string input(path);
-    if ((input.size() >= 2 && input[1] == ':') || input[0] == '\\' || input[0] == '/')
-        return input;
-
-    char modulePath[MAX_PATH] = {};
-    DWORD len = GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH)
-        return input;
-
-    std::string base(modulePath, len);
-    size_t slashPos = base.find_last_of("\\/");
-    if (slashPos == std::string::npos)
-        return input;
-
-    return base.substr(0, slashPos + 1) + input;
-}
-
-static int CALLBACK enumFontFamilyProc(const LOGFONTA* lf,
-                                       const TEXTMETRICA*,
-                                       DWORD,
-                                       LPARAM lParam)
-{
-    if (!lf || !lParam)
-        return 1;
-    auto* out = reinterpret_cast<std::set<std::string>*>(lParam);
-    out->insert(lf->lfFaceName);
-    return 1;
-}
-
-static void collectInstalledFontFamilies(HDC hdc, std::set<std::string>& outFamilies)
-{
-    LOGFONTA query = {};
-    query.lfCharSet = DEFAULT_CHARSET;
-    EnumFontFamiliesExA(hdc, &query, enumFontFamilyProc, reinterpret_cast<LPARAM>(&outFamilies), 0);
-}
-
-static std::string deriveFaceNameFromPath(const std::string& path)
-{
-    size_t slashPos = path.find_last_of("\\/");
-    size_t start = (slashPos == std::string::npos) ? 0 : slashPos + 1;
-    size_t dotPos = path.find_last_of('.');
-    if (dotPos == std::string::npos || dotPos < start)
-        dotPos = path.size();
-
-    std::string face = path.substr(start, dotPos - start);
-    for (char& ch : face)
+    if (value)
     {
-        if (ch == '-' || ch == '_' || ch == '.')
-            ch = ' ';
+        value->Release();
+        value = nullptr;
     }
-
-    // Collapse repeated spaces.
-    std::string normalized;
-    normalized.reserve(face.size());
-    bool prevSpace = false;
-    for (char ch : face)
-    {
-        bool isSpace = (ch == ' ');
-        if (isSpace && prevSpace)
-            continue;
-        normalized.push_back(ch);
-        prevSpace = isSpace;
-    }
-
-    return normalized;
 }
 
-static uint16_t readBE16(const uint8_t* p)
+struct SplashFrame
 {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]));
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<std::uint8_t> pixels;
+    BITMAPINFO bitmapInfo{};
+};
+
+struct SplashState
+{
+    std::vector<SplashFrame> frames;
+    std::size_t currentFrame = 0;
+    std::mutex framesMutex;
+    HANDLE loaderThread = nullptr;
+    std::atomic<bool> stopLoader = false;
+    std::atomic<HWND> hwnd = nullptr;
+    HHOOK mouseHook = nullptr;
+    HDC backBufferDC = nullptr;
+    HBITMAP backBufferBitmap = nullptr;
+    HGDIOBJ backBufferPreviousObject = nullptr;
+    void* backBufferPixels = nullptr;
+    UINT backBufferWidth = 0;
+    UINT backBufferHeight = 0;
+    HFONT titleBoldFont = nullptr;
+    HFONT titleRegularFont = nullptr;
+    HFONT subtitleFont = nullptr;
+    HFONT linkFont = nullptr;
+    RECT hyperlinkRect{};
+};
+
+BITMAPINFO makeBitmapInfo(UINT width, UINT height);
+
+ThemePalette queryThemePalette()
+{
+    const COLORREF windowColor = GetSysColor(COLOR_WINDOW);
+    ThemePalette palette;
+    palette.red = GetRValue(windowColor);
+    palette.green = GetGValue(windowColor);
+    palette.blue = GetBValue(windowColor);
+    palette.alpha = 255;
+
+    const int luminance = static_cast<int>(palette.red) * 2126 + static_cast<int>(palette.green) * 7152 + static_cast<int>(palette.blue) * 722;
+    palette.darkMode = luminance < (128 * 10000);
+    return palette;
 }
 
-static uint32_t readBE32(const uint8_t* p)
+void destroyFont(HFONT& font)
 {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-
-static std::string trimAndCollapseSpaces(std::string s)
-{
-    for (char& ch : s)
+    if (font)
     {
-        if (static_cast<unsigned char>(ch) < 32)
-            ch = ' ';
+        DeleteObject(font);
+        font = nullptr;
     }
-
-    std::string collapsed;
-    collapsed.reserve(s.size());
-    bool prevSpace = false;
-    for (char ch : s)
-    {
-        bool isSpace = (ch == ' ');
-        if (isSpace && prevSpace)
-            continue;
-        collapsed.push_back(ch);
-        prevSpace = isSpace;
-    }
-
-    size_t begin = 0;
-    while (begin < collapsed.size() && collapsed[begin] == ' ')
-        ++begin;
-
-    size_t end = collapsed.size();
-    while (end > begin && collapsed[end - 1] == ' ')
-        --end;
-
-    return collapsed.substr(begin, end - begin);
 }
 
-static std::string decodeNameString(const uint8_t* bytes, size_t len, uint16_t platformID)
+HFONT createArialFont(int pixelHeight, LONG weight, bool underline = false)
 {
-    std::string out;
-    if (platformID == 3)
+    LOGFONTW font{};
+    font.lfHeight = -pixelHeight;
+    font.lfWeight = weight;
+    font.lfUnderline = underline ? TRUE : FALSE;
+    font.lfCharSet = DEFAULT_CHARSET;
+#ifdef CLEARTYPE_NATURAL_QUALITY
+    font.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+#else
+    font.lfQuality = CLEARTYPE_QUALITY;
+#endif
+    wcscpy_s(font.lfFaceName, LF_FACESIZE, L"Arial");
+    return CreateFontIndirectW(&font);
+}
+
+SIZE measureTextExtent(HDC deviceContext, HFONT font, std::wstring_view text)
+{
+    SIZE size{};
+    if (!font || text.empty())
+        return size;
+
+    HGDIOBJ previousFont = SelectObject(deviceContext, font);
+    GetTextExtentPoint32W(deviceContext, text.data(), static_cast<int>(text.size()), &size);
+    SelectObject(deviceContext, previousFont);
+    return size;
+}
+
+TEXTMETRICW getFontMetrics(HDC deviceContext, HFONT font)
+{
+    TEXTMETRICW metrics{};
+    if (!font)
+        return metrics;
+
+    HGDIOBJ previousFont = SelectObject(deviceContext, font);
+    GetTextMetricsW(deviceContext, &metrics);
+    SelectObject(deviceContext, previousFont);
+    return metrics;
+}
+
+int measureTitleNaturalWidth(HDC deviceContext, HFONT titleBoldFont, HFONT titleRegularFont)
+{
+    int totalWidth = measureTextExtent(deviceContext, titleRegularFont, L" ").cx * static_cast<int>(kSplashTitleWords.size() - 1);
+    for (std::wstring_view word : kSplashTitleWords)
     {
-        if ((len & 1u) != 0u)
-            --len;
-        out.reserve(len / 2);
-        for (size_t i = 0; i + 1 < len; i += 2)
+        totalWidth += measureTextExtent(deviceContext, titleBoldFont, word.substr(0, 1)).cx;
+        totalWidth += measureTextExtent(deviceContext, titleRegularFont, word.substr(1)).cx;
+    }
+    return totalWidth;
+}
+
+bool createSplashFonts(SplashState& state, int splashWidth)
+{
+    HDC deviceContext = GetDC(nullptr);
+    if (!deviceContext)
+        return false;
+
+    const int availableWidth = std::max(256, splashWidth - (kSplashHorizontalPadding * 2));
+    int titleBoldHeight = 112;
+    int titleRegularHeight = 80;
+
+    while (true)
+    {
+        HFONT candidateBold = createArialFont(titleBoldHeight, FW_BOLD);
+        HFONT candidateRegular = createArialFont(titleRegularHeight, FW_NORMAL);
+        if (!candidateBold || !candidateRegular)
         {
-            uint16_t ch = readBE16(bytes + i);
-            if (ch == 0)
-                continue;
-            if (ch <= 0x7F)
-                out.push_back(static_cast<char>(ch));
-            else
-                out.push_back('?');
+            destroyFont(candidateBold);
+            destroyFont(candidateRegular);
+            ReleaseDC(nullptr, deviceContext);
+            return false;
         }
-    }
-    else
-    {
-        out.assign(reinterpret_cast<const char*>(bytes), len);
-    }
-    return trimAndCollapseSpaces(out);
-}
 
-static bool extractTTFNameFromMemory(const uint8_t* fontData,
-                                     size_t fontSize,
-                                     uint16_t wantedNameID,
-                                     std::string& outName)
-{
-    if (!fontData || fontSize < 12)
-        return false;
-
-    uint16_t numTables = readBE16(fontData + 4);
-    size_t tableDirOffset = 12;
-    if (tableDirOffset + static_cast<size_t>(numTables) * 16ull > fontSize)
-        return false;
-
-    uint32_t nameOffset = 0;
-    uint32_t nameLength = 0;
-    bool foundNameTable = false;
-    for (uint16_t i = 0; i < numTables; ++i)
-    {
-        const uint8_t* rec = fontData + tableDirOffset + static_cast<size_t>(i) * 16ull;
-        if (rec[0] == 'n' && rec[1] == 'a' && rec[2] == 'm' && rec[3] == 'e')
+        if (measureTitleNaturalWidth(deviceContext, candidateBold, candidateRegular) <= availableWidth || titleBoldHeight <= 64)
         {
-            nameOffset = readBE32(rec + 8);
-            nameLength = readBE32(rec + 12);
-            foundNameTable = true;
+            state.titleBoldFont = candidateBold;
+            state.titleRegularFont = candidateRegular;
             break;
         }
+
+        destroyFont(candidateBold);
+        destroyFont(candidateRegular);
+        --titleBoldHeight;
+        --titleRegularHeight;
     }
-    if (!foundNameTable)
-        return false;
 
-    if (static_cast<size_t>(nameOffset) >= fontSize)
-        return false;
-    if (static_cast<size_t>(nameLength) > fontSize - static_cast<size_t>(nameOffset))
-        return false;
-    if (nameLength < 6)
-        return false;
+    const int subtitleHeight = std::max(18, titleRegularHeight / 3);
+    state.subtitleFont = createArialFont(subtitleHeight, FW_NORMAL);
+    state.linkFont = createArialFont(subtitleHeight, FW_NORMAL, true);
 
-    const uint8_t* nameTable = fontData + nameOffset;
-    uint16_t count = readBE16(nameTable + 2);
-    uint16_t stringOffset = readBE16(nameTable + 4);
-    size_t recordsSize = static_cast<size_t>(count) * 12ull;
-    if (6ull + recordsSize > static_cast<size_t>(nameLength))
-        return false;
-
-    int bestScore = -1;
-    std::string best;
-    for (uint16_t i = 0; i < count; ++i)
+    const bool success = state.subtitleFont != nullptr && state.linkFont != nullptr;
+    ReleaseDC(nullptr, deviceContext);
+    if (!success)
     {
-        const uint8_t* rec = nameTable + 6 + static_cast<size_t>(i) * 12ull;
-        uint16_t platformID = readBE16(rec + 0);
-        uint16_t encodingID = readBE16(rec + 2);
-        uint16_t languageID = readBE16(rec + 4);
-        uint16_t nameID = readBE16(rec + 6);
-        uint16_t strLen = readBE16(rec + 8);
-        uint16_t strOff = readBE16(rec + 10);
-
-        if (nameID != wantedNameID)
-            continue;
-
-        size_t relOff = static_cast<size_t>(stringOffset) + static_cast<size_t>(strOff);
-        if (relOff > static_cast<size_t>(nameLength))
-            continue;
-        if (static_cast<size_t>(strLen) > static_cast<size_t>(nameLength) - relOff)
-            continue;
-
-        const uint8_t* strData = nameTable + relOff;
-        std::string decoded = decodeNameString(strData, strLen, platformID);
-        if (decoded.empty())
-            continue;
-
-        int score = 0;
-        if (platformID == 3)
-            score += 100;
-        else if (platformID == 1)
-            score += 50;
-        if (languageID == 0x0409)
-            score += 20;
-        if (platformID == 3 && (encodingID == 1 || encodingID == 10))
-            score += 10;
-
-        if (score > bestScore)
-        {
-            bestScore = score;
-            best = decoded;
-        }
+        destroyFont(state.titleBoldFont);
+        destroyFont(state.titleRegularFont);
+        destroyFont(state.subtitleFont);
+        destroyFont(state.linkFont);
     }
 
-    if (best.empty())
+    return success;
+}
+
+struct SplashTitleLayout
+{
+    std::array<int, 4> capitalWidths{};
+    std::array<int, 4> remainderWidths{};
+    int naturalWidth = 0;
+    int spaceWidth = 0;
+    TEXTMETRICW boldMetrics{};
+    TEXTMETRICW regularMetrics{};
+    TEXTMETRICW subtitleMetrics{};
+    TEXTMETRICW linkMetrics{};
+};
+
+SplashTitleLayout measureSplashTitleLayout(HDC deviceContext, const SplashState& state)
+{
+    SplashTitleLayout layout{};
+    layout.boldMetrics = getFontMetrics(deviceContext, state.titleBoldFont);
+    layout.regularMetrics = getFontMetrics(deviceContext, state.titleRegularFont);
+    layout.subtitleMetrics = getFontMetrics(deviceContext, state.subtitleFont);
+    layout.linkMetrics = getFontMetrics(deviceContext, state.linkFont);
+    layout.spaceWidth = measureTextExtent(deviceContext, state.titleRegularFont, L" ").cx;
+    layout.naturalWidth = layout.spaceWidth * static_cast<int>(kSplashTitleWords.size() - 1);
+
+    for (std::size_t index = 0; index < kSplashTitleWords.size(); ++index)
+    {
+        const std::wstring_view word = kSplashTitleWords[index];
+        layout.capitalWidths[index] = measureTextExtent(deviceContext, state.titleBoldFont, word.substr(0, 1)).cx;
+        layout.remainderWidths[index] = measureTextExtent(deviceContext, state.titleRegularFont, word.substr(1)).cx;
+        layout.naturalWidth += layout.capitalWidths[index] + layout.remainderWidths[index];
+    }
+
+    return layout;
+}
+
+void drawTextRun(HDC deviceContext, HFONT font, int x, int y, std::wstring_view text, COLORREF textColor, COLORREF shadowColor, int shadowOffset)
+{
+    if (!font || text.empty())
+        return;
+
+    HGDIOBJ previousFont = SelectObject(deviceContext, font);
+    SetTextColor(deviceContext, shadowColor);
+    TextOutW(deviceContext, x + shadowOffset, y + shadowOffset, text.data(), static_cast<int>(text.size()));
+    SetTextColor(deviceContext, textColor);
+    TextOutW(deviceContext, x, y, text.data(), static_cast<int>(text.size()));
+    SelectObject(deviceContext, previousFont);
+}
+
+void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT height)
+{
+    if (!state.titleBoldFont || !state.titleRegularFont || !state.subtitleFont || !state.linkFont)
+        return;
+
+    const SplashTitleLayout layout = measureSplashTitleLayout(deviceContext, state);
+    const int availableWidth = std::max(1, static_cast<int>(width) - (kSplashHorizontalPadding * 2));
+    const int gapCount = static_cast<int>(kSplashTitleWords.size() - 1);
+    const int freeWidth = std::max(0, availableWidth - layout.naturalWidth);
+    const int gapBonus = gapCount > 0 ? freeWidth / gapCount : 0;
+    const int gapRemainder = gapCount > 0 ? freeWidth % gapCount : 0;
+    const int titleBaseline = (static_cast<int>(height) * kSplashTextBlockAnchorYPercent) / 100;
+    const int capitalY = titleBaseline - layout.boldMetrics.tmAscent;
+    const int remainderY = titleBaseline - layout.regularMetrics.tmAscent;
+    const int titleBottom = std::max(capitalY + layout.boldMetrics.tmHeight, remainderY + layout.regularMetrics.tmHeight);
+    const int subtitleY = titleBottom + 12;
+    const COLORREF titleColor = RGB(248, 248, 248);
+    const COLORREF subtitleColor = RGB(236, 236, 236);
+    COLORREF linkColor = GetSysColor(COLOR_HOTLIGHT);
+    if (linkColor == 0)
+        linkColor = RGB(86, 156, 214);
+    const COLORREF shadowColor = RGB(12, 12, 12);
+
+    const int previousBkMode = SetBkMode(deviceContext, TRANSPARENT);
+
+    int x = kSplashHorizontalPadding;
+    for (std::size_t index = 0; index < kSplashTitleWords.size(); ++index)
+    {
+        const std::wstring_view word = kSplashTitleWords[index];
+        drawTextRun(deviceContext, state.titleBoldFont, x, capitalY, word.substr(0, 1), titleColor, shadowColor, 2);
+        x += layout.capitalWidths[index];
+        drawTextRun(deviceContext, state.titleRegularFont, x, remainderY, word.substr(1), titleColor, shadowColor, 2);
+        x += layout.remainderWidths[index];
+
+        if (index + 1 < kSplashTitleWords.size())
+            x += layout.spaceWidth + gapBonus + (static_cast<int>(index) < gapRemainder ? 1 : 0);
+    }
+
+    const std::wstring subtitlePrefix = std::wstring(L"Version ") + APP_VERSION_WSTRING + L"    Authored by: ";
+    const int prefixWidth = measureTextExtent(deviceContext, state.subtitleFont, subtitlePrefix).cx;
+    const int authorWidth = measureTextExtent(deviceContext, state.linkFont, kSplashAuthorName).cx;
+    const int subtitleX = kSplashHorizontalPadding;
+
+    drawTextRun(deviceContext, state.subtitleFont, subtitleX, subtitleY, subtitlePrefix, subtitleColor, shadowColor, 1);
+    drawTextRun(deviceContext, state.linkFont, subtitleX + prefixWidth, subtitleY, kSplashAuthorName, linkColor, shadowColor, 1);
+
+    state.hyperlinkRect.left = subtitleX + prefixWidth - 2;
+    state.hyperlinkRect.top = subtitleY - 2;
+    state.hyperlinkRect.right = subtitleX + prefixWidth + authorWidth + 2;
+    state.hyperlinkRect.bottom = subtitleY + std::max(layout.subtitleMetrics.tmHeight, layout.linkMetrics.tmHeight) + 2;
+
+    SetBkMode(deviceContext, previousBkMode);
+}
+
+bool createSplashBackBuffer(SplashState& state, UINT width, UINT height)
+{
+    BITMAPINFO bitmapInfo = makeBitmapInfo(width, height);
+
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc)
         return false;
 
-    outName = best;
+    HDC backBufferDc = CreateCompatibleDC(screenDc);
+    ReleaseDC(nullptr, screenDc);
+    if (!backBufferDc)
+        return false;
+
+    void* backBufferPixels = nullptr;
+    HBITMAP backBufferBitmap = CreateDIBSection(backBufferDc, &bitmapInfo, DIB_RGB_COLORS, &backBufferPixels, nullptr, 0);
+    if (!backBufferBitmap || !backBufferPixels)
+    {
+        if (backBufferBitmap)
+            DeleteObject(backBufferBitmap);
+        DeleteDC(backBufferDc);
+        return false;
+    }
+
+    state.backBufferPreviousObject = SelectObject(backBufferDc, backBufferBitmap);
+    state.backBufferDC = backBufferDc;
+    state.backBufferBitmap = backBufferBitmap;
+    state.backBufferPixels = backBufferPixels;
+    state.backBufferWidth = width;
+    state.backBufferHeight = height;
     return true;
 }
 
-unsigned char* RenderTextImageFromTTF(const char* ttfPath,
-                                      const char* text,
-                                      int fontPixelHeight,
-                                      uint8_t red,
-                                      uint8_t green,
-                                      uint8_t blue,
-                                      int* width,
-                                      int* height,
-                                      int* channels)
+void destroySplashBackBuffer(SplashState& state)
 {
-    if (!width || !height || !channels)
-        return nullptr;
-
-    *width = 0;
-    *height = 0;
-    *channels = 0;
-
-    if (!ttfPath || !*ttfPath || !text || !*text)
-        return nullptr;
-
-    std::string resolvedPath = resolvePathFromModuleDir(ttfPath);
-    HDC hdc = CreateCompatibleDC(nullptr);
-    if (!hdc)
-        return nullptr;
-
-    std::set<std::string> beforeFamilies;
-    std::set<std::string> afterFamilies;
-    collectInstalledFontFamilies(hdc, beforeFamilies);
-
-    bool fontLoaded = AddFontResourceExA(resolvedPath.c_str(), FR_PRIVATE, 0) > 0;
-    if (!fontLoaded)
+    if (state.backBufferDC)
     {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[System] AddFontResourceExA failed for %s\n", resolvedPath.c_str());
-        OutputDebugStringA(buf);
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    collectInstalledFontFamilies(hdc, afterFamilies);
-
-    std::string familyName;
-    for (const auto& fam : afterFamilies)
-    {
-        if (fam.empty() || fam[0] == '@')
-            continue;
-        if (beforeFamilies.find(fam) == beforeFamilies.end())
+        if (state.backBufferPreviousObject)
         {
-            familyName = fam;
-            break;
+            SelectObject(state.backBufferDC, state.backBufferPreviousObject);
+            state.backBufferPreviousObject = nullptr;
         }
-    }
 
-    if (familyName.empty())
-        familyName = deriveFaceNameFromPath(resolvedPath);
-
-    int requestedHeight = (fontPixelHeight > 0) ? fontPixelHeight : 256;
-    HFONT font = CreateFontA(
-        -requestedHeight,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_TT_ONLY_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        familyName.empty() ? nullptr : familyName.c_str());
-
-    if (!font)
-    {
-        RemoveFontResourceExA(resolvedPath.c_str(), FR_PRIVATE, 0);
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(255, 255, 255));
-
-    RECT measureRect = {0, 0, 0, 0};
-    DrawTextA(hdc, text, -1, &measureRect, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT);
-    int textW = measureRect.right - measureRect.left;
-    int textH = measureRect.bottom - measureRect.top;
-    int padX = std::max(8, requestedHeight / 12);
-    int padY = std::max(8, requestedHeight / 12);
-    int outW = std::max(1, textW + padX * 2);
-    int outH = std::max(1, textH + padY * 2);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = outW;
-    bmi.bmiHeader.biHeight = -outH; // Top-down bitmap.
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* dibBits = nullptr;
-    HBITMAP dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    if (!dib || !dibBits)
-    {
-        if (dib)
-            DeleteObject(dib);
-        SelectObject(hdc, oldFont);
-        DeleteObject(font);
-        RemoveFontResourceExA(resolvedPath.c_str(), FR_PRIVATE, 0);
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    HGDIOBJ oldBitmap = SelectObject(hdc, dib);
-    std::memset(dibBits, 0, static_cast<size_t>(outW) * static_cast<size_t>(outH) * 4ull);
-
-    RECT drawRect = {padX, padY, outW - padX, outH - padY};
-    DrawTextA(hdc, text, -1, &drawRect, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX);
-
-    unsigned char* rgba = static_cast<unsigned char*>(std::malloc(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 4ull));
-    if (rgba)
-    {
-        const unsigned char* bgra = static_cast<const unsigned char*>(dibBits);
-        size_t pixelCount = static_cast<size_t>(outW) * static_cast<size_t>(outH);
-        for (size_t i = 0; i < pixelCount; ++i)
+        if (state.backBufferBitmap)
         {
-            uint8_t b = bgra[i * 4 + 0];
-            uint8_t g = bgra[i * 4 + 1];
-            uint8_t r = bgra[i * 4 + 2];
-            uint8_t coverage = std::max(r, std::max(g, b));
-            rgba[i * 4 + 0] = red;
-            rgba[i * 4 + 1] = green;
-            rgba[i * 4 + 2] = blue;
-            rgba[i * 4 + 3] = coverage;
+            DeleteObject(state.backBufferBitmap);
+            state.backBufferBitmap = nullptr;
         }
-        *width = outW;
-        *height = outH;
-        *channels = 4;
+
+        DeleteDC(state.backBufferDC);
+        state.backBufferDC = nullptr;
     }
 
-    SelectObject(hdc, oldBitmap);
-    DeleteObject(dib);
-    SelectObject(hdc, oldFont);
-    DeleteObject(font);
-    RemoveFontResourceExA(resolvedPath.c_str(), FR_PRIVATE, 0);
-    DeleteDC(hdc);
-    return rgba;
+    state.backBufferPixels = nullptr;
+    state.backBufferWidth = 0;
+    state.backBufferHeight = 0;
 }
 
-unsigned char* RenderTextImageFromTTFResource(int resourceID,
-                                              const char* text,
-                                              int fontPixelHeight,
-                                              uint8_t red,
-                                              uint8_t green,
-                                              uint8_t blue,
-                                              int* width,
-                                              int* height,
-                                              int* channels)
+BITMAPINFO makeBitmapInfo(UINT width, UINT height)
 {
-    if (!width || !height || !channels)
-        return nullptr;
-
-    *width = 0;
-    *height = 0;
-    *channels = 0;
-
-    if (!text || !*text)
-        return nullptr;
-
-    HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(resourceID), RT_RCDATA);
-    if (!hRes)
-        return nullptr;
-
-    HGLOBAL hMem = LoadResource(NULL, hRes);
-    if (!hMem)
-        return nullptr;
-
-    void* fontData = LockResource(hMem);
-    DWORD fontSize = SizeofResource(NULL, hRes);
-    if (!fontData || fontSize == 0)
-        return nullptr;
-
-    HDC hdc = CreateCompatibleDC(nullptr);
-    if (!hdc)
-        return nullptr;
-
-    std::set<std::string> beforeFamilies;
-    std::set<std::string> afterFamilies;
-    collectInstalledFontFamilies(hdc, beforeFamilies);
-
-    DWORD fontCount = 0;
-    HANDLE fontHandle = AddFontMemResourceEx(fontData, fontSize, nullptr, &fontCount);
-    if (!fontHandle || fontCount == 0)
-    {
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    collectInstalledFontFamilies(hdc, afterFamilies);
-
-    std::string familyName;
-    for (const auto& fam : afterFamilies)
-    {
-        if (fam.empty() || fam[0] == '@')
-            continue;
-        if (beforeFamilies.find(fam) == beforeFamilies.end())
-        {
-            familyName = fam;
-            break;
-        }
-    }
-
-    if (familyName.empty())
-    {
-        const uint8_t* fontBytes = static_cast<const uint8_t*>(fontData);
-        extractTTFNameFromMemory(fontBytes, static_cast<size_t>(fontSize), 16, familyName);
-        if (familyName.empty())
-            extractTTFNameFromMemory(fontBytes, static_cast<size_t>(fontSize), 1, familyName);
-    }
-
-    if (familyName.empty())
-    {
-        OutputDebugStringA("[System] Could not resolve embedded font family name; falling back to Arial\n");
-        familyName = "Arial";
-    }
-
-    int requestedHeight = (fontPixelHeight > 0) ? fontPixelHeight : 256;
-    HFONT font = CreateFontA(
-        -requestedHeight,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_TT_ONLY_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        familyName.c_str());
-
-    if (!font)
-    {
-        RemoveFontMemResourceEx(fontHandle);
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(255, 255, 255));
-
-    RECT measureRect = {0, 0, 0, 0};
-    DrawTextA(hdc, text, -1, &measureRect, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT);
-    int textW = measureRect.right - measureRect.left;
-    int textH = measureRect.bottom - measureRect.top;
-    int padX = std::max(8, requestedHeight / 12);
-    int padY = std::max(8, requestedHeight / 12);
-    int outW = std::max(1, textW + padX * 2);
-    int outH = std::max(1, textH + padY * 2);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = outW;
-    bmi.bmiHeader.biHeight = -outH;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* dibBits = nullptr;
-    HBITMAP dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    if (!dib || !dibBits)
-    {
-        if (dib)
-            DeleteObject(dib);
-        SelectObject(hdc, oldFont);
-        DeleteObject(font);
-        RemoveFontMemResourceEx(fontHandle);
-        DeleteDC(hdc);
-        return nullptr;
-    }
-
-    HGDIOBJ oldBitmap = SelectObject(hdc, dib);
-    std::memset(dibBits, 0, static_cast<size_t>(outW) * static_cast<size_t>(outH) * 4ull);
-
-    RECT drawRect = {padX, padY, outW - padX, outH - padY};
-    DrawTextA(hdc, text, -1, &drawRect, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX);
-
-    unsigned char* rgba = static_cast<unsigned char*>(std::malloc(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 4ull));
-    if (rgba)
-    {
-        const unsigned char* bgra = static_cast<const unsigned char*>(dibBits);
-        size_t pixelCount = static_cast<size_t>(outW) * static_cast<size_t>(outH);
-        for (size_t i = 0; i < pixelCount; ++i)
-        {
-            uint8_t b = bgra[i * 4 + 0];
-            uint8_t g = bgra[i * 4 + 1];
-            uint8_t r = bgra[i * 4 + 2];
-            uint8_t coverage = std::max(r, std::max(g, b));
-            rgba[i * 4 + 0] = red;
-            rgba[i * 4 + 1] = green;
-            rgba[i * 4 + 2] = blue;
-            rgba[i * 4 + 3] = coverage;
-        }
-        *width = outW;
-        *height = outH;
-        *channels = 4;
-    }
-
-    SelectObject(hdc, oldBitmap);
-    DeleteObject(dib);
-    SelectObject(hdc, oldFont);
-    DeleteObject(font);
-    RemoveFontMemResourceEx(fontHandle);
-    DeleteDC(hdc);
-    return rgba;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = static_cast<LONG>(width);
+    info.bmiHeader.biHeight = -static_cast<LONG>(height);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    return info;
 }
 
-void FreeImage(unsigned char* data)
+RECT centerRectOnBounds(const RECT& bounds, int width, int height)
 {
-    if (data) stbi_image_free(data);
+    RECT rect{};
+    rect.left = bounds.left + ((bounds.right - bounds.left) - width) / 2;
+    rect.top = bounds.top + ((bounds.bottom - bounds.top) - height) / 2;
+    rect.right = rect.left + width;
+    rect.bottom = rect.top + height;
+    return rect;
 }
 
-// CPU feature detection structure
-CPUFeatures cpuFeatures;
-
-//
-// Detect CPU features using CPUID instruction
-//
-void DetectCPUFeatures()
+SplashState* getSplashState(HWND hwnd)
 {
-    int cpuInfo[4] = {0};
-
-    // Check features with function 1
-    __cpuid(cpuInfo, 1);
-    cpuFeatures.sse = (cpuInfo[3] & (1 << 25)) != 0;    // EDX bit 25
-    cpuFeatures.sse2 = (cpuInfo[3] & (1 << 26)) != 0;   // EDX bit 26
-    cpuFeatures.sse3 = (cpuInfo[2] & (1 << 0)) != 0;    // ECX bit 0
-    cpuFeatures.ssse3 = (cpuInfo[2] & (1 << 9)) != 0;   // ECX bit 9
-    cpuFeatures.sse41 = (cpuInfo[2] & (1 << 19)) != 0;  // ECX bit 19
-    cpuFeatures.sse42 = (cpuInfo[2] & (1 << 20)) != 0;  // ECX bit 20
-    bool avxCpu = (cpuInfo[2] & (1 << 28)) != 0;        // ECX bit 28 AVX
-    bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;       // ECX bit 27 OSXSAVE
-
-    // Check features with function 7
-    __cpuid(cpuInfo, 7);
-    bool avx2Cpu = (cpuInfo[1] & (1 << 5)) != 0;        // EBX bit 5
-    cpuFeatures.avx512 = (cpuInfo[1] & (1 << 16)) != 0; // EBX bit 16 (broad brush)
-
-    // OS support check for AVX state (XCR0: XMM bit1 and YMM bit2 must be set)
-    bool avxOs = false;
-#ifdef _XCR_XFEATURE_ENABLED_MASK
-    if (osxsave)
-    {
-        unsigned long long xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
-        avxOs = (xcr0 & 0x6) == 0x6; // XMM (bit1) and YMM (bit2)
-    }
-#endif
-    cpuFeatures.avx = avxCpu && avxOs;
-    cpuFeatures.avx2 = avx2Cpu && avxOs;
+    return reinterpret_cast<SplashState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
-//
-// Choose the highest supported SIMD level for hot-path conversions
-//
-void SetBestSIMDLevel()
+void destroySplashState(SplashState* state)
 {
-    using SIMD = GameState::SIMDLevel;
-    // Prefer AVX2 > SSSE3 > SSE2 > Scalar
-    if (cpuFeatures.avx2)
-    {
-        state.simd = SIMD::AVX2;
-    }
-    else if (cpuFeatures.ssse3)
-    {
-        state.simd = SIMD::SSSE3;
-    }
-    else if (cpuFeatures.sse2)
-    {
-        state.simd = SIMD::SSE2;
-    }
-    else
-    {
-        state.simd = SIMD::Scalar;
-    }
-}
-
-//
-// Generate CPU feature text for system information
-//
-std::string GenerateSystemInfoText()
-{
-    std::string text;
-    text.reserve(220);
-    text += "  SSE: " + std::string(cpuFeatures.sse ? "Yes" : "No") + "\n";
-    text += "  SSE2: " + std::string(cpuFeatures.sse2 ? "Yes" : "No") + "\n";
-    text += "  SSE3: " + std::string(cpuFeatures.sse3 ? "Yes" : "No") + "\n";
-    text += "  SSSE3: " + std::string(cpuFeatures.ssse3 ? "Yes" : "No") + "\n";
-    text += "  SSE4.1: " + std::string(cpuFeatures.sse41 ? "Yes" : "No") + "\n";
-    text += "  SSE4.2: " + std::string(cpuFeatures.sse42 ? "Yes" : "No") + "\n";
-    text += "  AVX: " + std::string(cpuFeatures.avx ? "Yes" : "No") + "\n";
-    text += "  AVX2: " + std::string(cpuFeatures.avx2 ? "Yes" : "No") + "\n";
-    text += "  AVX-512: " + std::string(cpuFeatures.avx512 ? "Yes" : "No") + "\n";
-    const char* selected = "Scalar";
-    if (state.simd == GameState::SIMDLevel::SSE2)
-        selected = "SSE2";
-    else if (state.simd == GameState::SIMDLevel::SSSE3)
-        selected = "SSSE3";
-    else if (state.simd == GameState::SIMDLevel::AVX2)
-        selected = "AVX2";
-    text += "  Selected SIMD: " + std::string(selected) + "\n";
-    return text;
-}
-
-//
-// Load BMP from resource and create GDI bitmap
-//
-HBITMAP LoadBMPResourceToBitmap(int resourceId, HDC hdc, int &width, int &height)
-{
-    HRSRC res = FindResource(nullptr, MAKEINTRESOURCE(resourceId), RT_RCDATA);
-    if (!res)
-        return nullptr;
-    
-    HGLOBAL hRes = LoadResource(nullptr, res);
-    if (!hRes)
-        return nullptr;
-    
-    void *pData = LockResource(hRes);
-    DWORD dataSize = SizeofResource(nullptr, res);
-    if (!pData || dataSize == 0)
-        return nullptr;
-    
-    // Create a memory stream from the resource data
-    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-    if (!hGlobal)
-        return nullptr;
-    
-    void *pGlobalData = GlobalLock(hGlobal);
-    if (!pGlobalData)
-    {
-        GlobalFree(hGlobal);
-        return nullptr;
-    }
-    
-    memcpy(pGlobalData, pData, dataSize);
-    GlobalUnlock(hGlobal);
-    
-    IStream *pStream = nullptr;
-    if (CreateStreamOnHGlobal(hGlobal, TRUE, &pStream) != S_OK)
-    {
-        GlobalFree(hGlobal);
-        return nullptr;
-    }
-    
-    // Skip BMP header and get dimensions
-    BITMAPFILEHEADER *bmfh = static_cast<BITMAPFILEHEADER*>(pData);
-    BITMAPINFOHEADER *bmih = reinterpret_cast<BITMAPINFOHEADER*>(static_cast<char*>(pData) + sizeof(BITMAPFILEHEADER));
-    
-    if (bmfh->bfType != 0x4D42) // "BM" signature
-    {
-        pStream->Release();
-        return nullptr;
-    }
-    
-    width = bmih->biWidth;
-    height = abs(bmih->biHeight);
-    
-    // Create bitmap from the BMP data
-    BITMAPINFO *bmi = reinterpret_cast<BITMAPINFO*>(bmih);
-    void *bits = static_cast<char*>(pData) + bmfh->bfOffBits;
-    
-    HBITMAP hBitmap = CreateDIBitmap(hdc, bmih, CBM_INIT, bits, bmi, DIB_RGB_COLORS);
-    
-    pStream->Release();
-    return hBitmap;
-}
-
-//
-// Show the system information window
-//
-void ShowSystemInfoWindow()
-{
-    HINSTANCE hInstance = GetModuleHandle(NULL);
-    const char *className = "PhantomSystemInfoClass";
-
-    // Initialize window class structure
-    WNDCLASSEXA wc = {};
-    wc.cbSize = sizeof(WNDCLASSEXA);
-    wc.lpfnWndProc = SystemInfoWndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = className;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-
-    // Register window class
-    if (!RegisterClassExA(&wc))
-    {
-        DWORD error = GetLastError();
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer),
-                 "Failed to register window class. Error: 0x%lX", error);
-        MessageBoxA(NULL, buffer, "Error", MB_OK | MB_ICONERROR);
+    if (!state)
         return;
-    }
 
-    // Get display info using existing code from window.cpp
-    state.ui.displays.clear();
-    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, 0);
+    state->stopLoader.store(true);
 
-    // Find target display
-    int targetDisplay = config["display"];
-    const DisplayInfo *selectedDisplay = nullptr;
-    for (const auto &display : state.ui.displays)
+    if (state->mouseHook)
+        UnhookWindowsHookEx(state->mouseHook);
+
+    if (state->loaderThread)
     {
-        if (display.number == targetDisplay)
-        {
-            selectedDisplay = &display;
-            break;
-        }
+        WaitForSingleObject(state->loaderThread, INFINITE);
+        CloseHandle(state->loaderThread);
+        state->loaderThread = nullptr;
     }
 
-    // Fallback to primary display if not found
-    if (!selectedDisplay)
-    {
-        for (const auto &display : state.ui.displays)
-        {
-            if (display.isPrimary)
-            {
-                selectedDisplay = &display;
-                break;
-            }
-        }
-    }
+    destroySplashBackBuffer(*state);
+    destroyFont(state->titleBoldFont);
+    destroyFont(state->titleRegularFont);
+    destroyFont(state->subtitleFont);
+    destroyFont(state->linkFont);
 
-    // Fallback to first display if still not found
-    if (!selectedDisplay && !state.ui.displays.empty())
-    {
-        selectedDisplay = &state.ui.displays[0];
-    }
-
-    // Set window size to 1280x720 (DVD resolution)
-    const int WINDOW_WIDTH = 1280;
-    const int WINDOW_HEIGHT = 720;
-
-    // Calculate centered position
-    int x = 0, y = 0;
-    if (selectedDisplay)
-    {
-        RECT bounds = selectedDisplay->bounds;
-        x = bounds.left + (bounds.right - bounds.left - WINDOW_WIDTH) / 2;
-        y = bounds.top + (bounds.bottom - bounds.top - WINDOW_HEIGHT) / 2;
-    }
-    else
-    {
-        // Fallback to screen center
-        x = (GetSystemMetrics(SM_CXSCREEN) - WINDOW_WIDTH) / 2;
-        y = (GetSystemMetrics(SM_CYSCREEN) - WINDOW_HEIGHT) / 2;
-    }
-
-    // Create borderless window
-    HWND hwnd = CreateWindowExA(
-        0, // No extended styles
-        className,
-    "Phantom Engine System Info",
-        WS_POPUP, // Borderless window
-        x, y,
-        WINDOW_WIDTH, WINDOW_HEIGHT,
-        NULL, NULL, hInstance, NULL);
-
-    if (!hwnd)
-    {
-        DWORD error = GetLastError();
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer),
-                 "Failed to create window. Error: 0x%lX", error);
-        MessageBoxA(NULL, buffer, "Error", MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    // Show and update window
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-
-    // Message loop
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
+    delete state;
 }
 
-////////////////////////////////////////////////////////////////////////
-// Window Procedure
-////////////////////////////////////////////////////////////////////////
-LRESULT CALLBACK SystemInfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK SplashMouseHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    switch (msg)
+    if (code >= 0 && g_splashWindow)
     {
-    case WM_PAINT:
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN)
+        {
+            const auto* hookData = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+            RECT splashRect{};
+            if (!GetWindowRect(g_splashWindow, &splashRect) || !PtInRect(&splashRect, hookData->pt))
+                PostMessageW(g_splashWindow, WM_CLOSE, 0, 0);
+        }
+    }
+
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+bool decodePngResourceBGRAWithFactory(IWICImagingFactory* factory, int resourceID, DecodedImage& image)
+{
+    image = {};
+
+    if (!factory)
+        return false;
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceID), RT_RCDATA);
+    if (!resource)
+        return false;
+
+    HGLOBAL resourceHandle = LoadResource(module, resource);
+    if (!resourceHandle)
+        return false;
+
+    void* memory = LockResource(resourceHandle);
+    const DWORD resourceSize = SizeofResource(module, resource);
+    if (!memory || resourceSize == 0)
+        return false;
+
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+
+    HRESULT result = factory->CreateStream(&stream);
+    if (SUCCEEDED(result))
+        result = stream->InitializeFromMemory(static_cast<BYTE*>(memory), resourceSize);
+    if (SUCCEEDED(result))
+        result = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    if (SUCCEEDED(result))
+        result = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(result))
+        result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result))
     {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
+        result = converter->Initialize(
+            frame,
+            GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom);
+    }
 
-        static HBITMAP hBmp = nullptr;
-        static int bmpW = 0, bmpH = 0;
-        if (!hBmp)
-        {
-            hBmp = LoadBMPResourceToBitmap(IDB_SYSINFO_BG, hdc, bmpW, bmpH);
-        }
+    if (FAILED(result))
+    {
+        safeRelease(converter);
+        safeRelease(frame);
+        safeRelease(decoder);
+        safeRelease(stream);
+        return false;
+    }
 
-        if (hBmp)
-        {
-            HDC memDC = CreateCompatibleDC(hdc);
-            HGDIOBJ oldBmp = SelectObject(memDC, hBmp);
-            BitBlt(hdc, 0, 0, bmpW, bmpH, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBmp);
-            DeleteDC(memDC);
-        }
+    UINT width = 0;
+    UINT height = 0;
+    converter->GetSize(&width, &height);
+    if (width == 0 || height == 0)
+    {
+        safeRelease(converter);
+        safeRelease(frame);
+        safeRelease(decoder);
+        safeRelease(stream);
+        return false;
+    }
 
-        // Draw text in bottom-left corner, with padding
-        const int pad_x = 32;
-        const int pad_y = 32;
-        RECT clientRect;
-        GetClientRect(hwnd, &clientRect);
+    const UINT stride = width * 4;
+    const UINT bufferSize = stride * height;
+    image.width = width;
+    image.height = height;
+    image.pixels.resize(bufferSize);
 
-        RECT textRect;
-        textRect.left = pad_x;
-        textRect.right = clientRect.right - pad_x;
-        textRect.bottom = clientRect.bottom - pad_y;
-        textRect.top = textRect.bottom - 200; // Height for text
+    result = converter->CopyPixels(nullptr, stride, bufferSize, image.pixels.data());
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        std::string text = GenerateSystemInfoText();
-        DrawTextA(hdc, text.c_str(), -1, &textRect, DT_LEFT | DT_BOTTOM | DT_WORDBREAK | DT_NOCLIP);
+    safeRelease(converter);
+    safeRelease(frame);
+    safeRelease(decoder);
+    safeRelease(stream);
 
-        EndPaint(hwnd, &ps);
+    return SUCCEEDED(result);
+}
+
+bool decodePngFileBGRAWithFactory(IWICImagingFactory* factory, const std::filesystem::path& filename, DecodedImage& image)
+{
+    image = {};
+
+    if (!factory || filename.empty())
+        return false;
+
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+
+    HRESULT result = factory->CreateDecoderFromFilename(
+        filename.wstring().c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand,
+        &decoder);
+
+    if (SUCCEEDED(result))
+        result = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(result))
+        result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result))
+    {
+        result = converter->Initialize(
+            frame,
+            GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom);
+    }
+
+    if (FAILED(result))
+    {
+        safeRelease(converter);
+        safeRelease(frame);
+        safeRelease(decoder);
+        return false;
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    converter->GetSize(&width, &height);
+    if (width == 0 || height == 0)
+    {
+        safeRelease(converter);
+        safeRelease(frame);
+        safeRelease(decoder);
+        return false;
+    }
+
+    const UINT stride = width * 4;
+    const UINT bufferSize = stride * height;
+    image.width = width;
+    image.height = height;
+    image.pixels.resize(bufferSize);
+
+    result = converter->CopyPixels(nullptr, stride, bufferSize, image.pixels.data());
+
+    safeRelease(converter);
+    safeRelease(frame);
+    safeRelease(decoder);
+
+    return SUCCEEDED(result);
+}
+
+std::size_t countSplashFrameResources()
+{
+    std::size_t count = 0;
+    HMODULE module = GetModuleHandleW(nullptr);
+    for (int resourceId = IDR_SPLASH_FRAME_FIRST; FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA); ++resourceId)
+        ++count;
+
+    return count;
+}
+
+unsigned __stdcall SplashLoaderThreadProc(void* parameter)
+{
+    auto* state = static_cast<SplashState*>(parameter);
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitializeCom = SUCCEEDED(comResult);
+    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE)
+        return 0;
+
+    IWICImagingFactory* threadFactory = nullptr;
+    const HRESULT factoryResult = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&threadFactory));
+
+    if (FAILED(factoryResult))
+    {
+        if (uninitializeCom)
+            CoUninitialize();
         return 0;
     }
-    case WM_KEYDOWN:
-        // Close on ESC, Enter, or Space
-        if (wParam == VK_ESCAPE || wParam == VK_RETURN || wParam == VK_SPACE)
+
+    for (int resourceId = IDR_SPLASH_FRAME_FIRST + 1; !state->stopLoader.load(); ++resourceId)
+    {
+        DecodedImage image;
+        if (!decodePngResourceBGRAWithFactory(threadFactory, resourceId, image))
+            break;
+
+        SplashFrame frame;
+        frame.width = image.width;
+        frame.height = image.height;
+        frame.pixels = std::move(image.pixels);
+        frame.bitmapInfo = makeBitmapInfo(frame.width, frame.height);
+
         {
-            DestroyWindow(hwnd);
+            std::scoped_lock lock(state->framesMutex);
+            state->frames.push_back(std::move(frame));
+        }
+
+        HWND hwnd = state->hwnd.load();
+        if (hwnd)
+            PostMessageW(hwnd, kSplashFrameReadyMessage, 0, 0);
+    }
+
+    safeRelease(threadFactory);
+    if (uninitializeCom)
+        CoUninitialize();
+
+    return 0;
+}
+
+LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_NCCREATE:
+    {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return TRUE;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_TIMER:
+    {
+        SplashState* state = getSplashState(hwnd);
+        if (!state || wParam != kSplashTimerId)
+            return 0;
+
+        std::size_t frameCount = 0;
+        {
+            std::scoped_lock lock(state->framesMutex);
+            frameCount = state->frames.size();
+            if (frameCount > 1)
+                state->currentFrame = (state->currentFrame + 1) % frameCount;
+        }
+
+        if (frameCount > 1)
+            InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
+    case kSplashFrameReadyMessage:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_LBUTTONDOWN:
+    {
+        SplashState* state = getSplashState(hwnd);
+        POINT clickPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (state && PtInRect(&state->hyperlinkRect, clickPoint))
+            ShellExecuteW(hwnd, L"open", kSplashAuthorUrl, nullptr, nullptr, SW_SHOWNORMAL);
+
+        DestroyWindow(hwnd);
+        return 0;
+    }
+
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_KEYDOWN:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT)
+        {
+            SplashState* state = getSplashState(hwnd);
+            POINT cursorPoint{};
+            GetCursorPos(&cursorPoint);
+            ScreenToClient(hwnd, &cursorPoint);
+            if (state && PtInRect(&state->hyperlinkRect, cursorPoint))
+            {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
         }
         break;
 
-    case WM_DESTROY:
-        PostQuitMessage(0);
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC deviceContext = BeginPaint(hwnd, &paint);
+        SplashState* state = getSplashState(hwnd);
+        if (state && state->backBufferDC && state->backBufferPixels)
+        {
+            UINT frameWidth = 0;
+            UINT frameHeight = 0;
+
+            {
+                std::scoped_lock lock(state->framesMutex);
+                if (!state->frames.empty())
+                {
+                    state->currentFrame = std::min(state->currentFrame, state->frames.size() - 1);
+                    const SplashFrame& frame = state->frames[state->currentFrame];
+                    std::memcpy(state->backBufferPixels, frame.pixels.data(), frame.pixels.size());
+                    frameWidth = frame.width;
+                    frameHeight = frame.height;
+                }
+            }
+
+            if (frameWidth != 0 && frameHeight != 0)
+            {
+                drawSplashOverlay(state->backBufferDC, *state, frameWidth, frameHeight);
+                BitBlt(deviceContext, 0, 0, static_cast<int>(frameWidth), static_cast<int>(frameHeight), state->backBufferDC, 0, 0, SRCCOPY);
+            }
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
         return 0;
 
-    default:
-        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    case WM_DESTROY:
+    {
+        SplashState* state = getSplashState(hwnd);
+        if (state)
+            state->hwnd.store(nullptr);
+        KillTimer(hwnd, kSplashTimerId);
+        g_splashWindow = nullptr;
+        return 0;
     }
-    return 0;
+
+    case WM_NCDESTROY:
+    {
+        SplashState* state = getSplashState(hwnd);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        destroySplashState(state);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+}
+
+bool initializeSystemServices()
+{
+    if (g_wicFactory)
+        return true;
+
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (SUCCEEDED(comResult))
+        g_comInitialized = true;
+    else if (comResult != RPC_E_CHANGED_MODE)
+        return false;
+
+    const HRESULT factoryResult = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&g_wicFactory));
+
+    if (FAILED(factoryResult))
+        return false;
+
+    refreshThemePalette();
+    return true;
+}
+
+void shutdownSystemServices()
+{
+    safeRelease(g_wicFactory);
+
+    if (g_comInitialized)
+    {
+        CoUninitialize();
+        g_comInitialized = false;
+    }
+}
+
+void refreshThemePalette()
+{
+    g_themePalette = queryThemePalette();
+}
+
+const ThemePalette& getThemePalette()
+{
+    return g_themePalette;
+}
+
+COLORREF getThemeColorRef()
+{
+    return RGB(g_themePalette.red, g_themePalette.green, g_themePalette.blue);
+}
+
+void applyWindowTheme(HWND hwnd)
+{
+    if (!hwnd)
+        return;
+
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
+bool decodePngResourceBGRA(int resourceID, DecodedImage& image)
+{
+    return decodePngResourceBGRAWithFactory(g_wicFactory, resourceID, image);
+}
+
+bool decodePngFileBGRA(const std::filesystem::path& filename, DecodedImage& image)
+{
+    return decodePngFileBGRAWithFactory(g_wicFactory, filename, image);
+}
+
+bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)
+{
+    static bool classRegistered = false;
+    if (!classRegistered)
+    {
+        WNDCLASSEXW windowClass{};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = SplashWindowProc;
+        windowClass.hInstance = instance;
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.lpszClassName = kSplashWindowClassName;
+
+        if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return false;
+
+        classRegistered = true;
+    }
+
+    DecodedImage image;
+    if (!decodePngResourceBGRA(IDR_SPLASH_FRAME_FIRST, image))
+        return false;
+
+    auto* state = new SplashState();
+    state->frames.reserve(std::max<std::size_t>(countSplashFrameResources(), 1));
+
+    SplashFrame firstFrame;
+    firstFrame.width = image.width;
+    firstFrame.height = image.height;
+    firstFrame.pixels = std::move(image.pixels);
+    firstFrame.bitmapInfo = makeBitmapInfo(firstFrame.width, firstFrame.height);
+    state->frames.push_back(std::move(firstFrame));
+
+    const int splashWidth = static_cast<int>(state->frames.front().width);
+    const int splashHeight = static_cast<int>(state->frames.front().height);
+    if (!createSplashFonts(*state, splashWidth))
+    {
+        destroySplashState(state);
+        return false;
+    }
+
+    if (!createSplashBackBuffer(*state, state->frames.front().width, state->frames.front().height))
+    {
+        destroySplashState(state);
+        return false;
+    }
+
+    const RECT splashRect = centerRectOnBounds(monitorBounds, splashWidth, splashHeight);
+
+    HWND splashWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kSplashWindowClassName,
+        L"SIMP Splash",
+        WS_POPUP,
+        splashRect.left,
+        splashRect.top,
+        splashWidth,
+        splashHeight,
+        owner,
+        nullptr,
+        instance,
+        state);
+
+    if (!splashWindow)
+    {
+        destroySplashState(state);
+        return false;
+    }
+
+    g_splashWindow = splashWindow;
+    state->hwnd.store(splashWindow);
+    state->mouseHook = SetWindowsHookExW(WH_MOUSE_LL, SplashMouseHookProc, instance, 0);
+    state->loaderThread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, SplashLoaderThreadProc, state, 0, nullptr));
+
+    ShowWindow(splashWindow, SW_SHOWNOACTIVATE);
+    UpdateWindow(splashWindow);
+    SetTimer(splashWindow, kSplashTimerId, kSplashFrameIntervalMs, nullptr);
+
+    return true;
 }

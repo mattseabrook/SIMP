@@ -1,61 +1,36 @@
-// system.h
+#ifndef SIMP_SYSTEM_H
+#define SIMP_SYSTEM_H
 
-#ifndef SYSTEM_H
-#define SYSTEM_H
+#include <cstdint>
+#include <filesystem>
+#include <vector>
 
 #include <windows.h>
-#include <cstdint>
 
-unsigned char* LoadImageFromResource(int resourceID, int* width, int* height, int* channels);
-unsigned char* RenderTextImageFromTTF(const char* ttfPath,
-                                      const char* text,
-                                      int fontPixelHeight,
-                                      uint8_t red,
-                                      uint8_t green,
-                                      uint8_t blue,
-                                      int* width,
-                                      int* height,
-                                      int* channels);
-unsigned char* RenderTextImageFromTTFResource(int resourceID,
-                                              const char* text,
-                                              int fontPixelHeight,
-                                              uint8_t red,
-                                              uint8_t green,
-                                              uint8_t blue,
-                                              int* width,
-                                              int* height,
-                                              int* channels);
-void FreeImage(unsigned char* data);
-
-/*
-===============================================================================
-
-    Phantom Engine - System Information Window
-
-    This header file contains the function prototypes for cross-platform
-    system information window functionality. It is used to display system
-    information such as CPU features, and GPU capabilities.
-
-===============================================================================
-*/
-struct CPUFeatures
+struct ThemePalette
 {
-    bool sse = false;
-    bool sse2 = false;
-    bool sse3 = false;
-    bool ssse3 = false;
-    bool sse41 = false;
-    bool sse42 = false;
-    bool avx = false;
-    bool avx2 = false;
-    bool avx512 = false;
+    std::uint8_t red = 32;
+    std::uint8_t green = 32;
+    std::uint8_t blue = 32;
+    std::uint8_t alpha = 255;
+    bool darkMode = true;
 };
 
-extern CPUFeatures cpuFeatures;
+struct DecodedImage
+{
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<std::uint8_t> pixels;
+};
 
-// Function prototypes
-void ShowSystemInfoWindow();
-void DetectCPUFeatures();
-void SetBestSIMDLevel();
+bool initializeSystemServices();
+void shutdownSystemServices();
+void refreshThemePalette();
+const ThemePalette& getThemePalette();
+COLORREF getThemeColorRef();
+void applyWindowTheme(HWND hwnd);
+bool decodePngResourceBGRA(int resourceID, DecodedImage& image);
+bool decodePngFileBGRA(const std::filesystem::path& filename, DecodedImage& image);
+bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds);
 
-#endif // SYSTEM_H
+#endif

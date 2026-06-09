@@ -1,143 +1,123 @@
-// menu.cpp
-
-#include "../resource.h" // For resource IDs
-
 #include "menu.h"
-#include "window.h"
+
+#include "app.h"
 #include "config.h"
+#include "system.h"
+#include "window.h"
 
-#ifndef DBG_LOG
-#define DBG_LOG(msg) OutputDebugStringA("[Phantom:Menu] " msg "\n")
-#define DBG_LOGF(fmt, ...) do { char _dbg_buf[512]; snprintf(_dbg_buf, sizeof(_dbg_buf), "[Phantom:Menu] " fmt "\n", __VA_ARGS__); OutputDebugStringA(_dbg_buf); } while(0)
-#endif
+#include "../resource.h"
 
-/*
-===============================================================================
-Function Name: initMenu
-
-Description:
-    - Initializes the menu for the main window.
-    - Creates the File and Help menus with their respective items.
-
-Parameters:
-    - hwnd: Handle to the main window.
-===============================================================================
-*/
-void initMenu(HWND hwnd)
+namespace
 {
-    DBG_LOG("initMenu() entered");
-    HMENU hMenu = CreateMenu();
-    DBG_LOGF("CreateMenu() returned %p", (void*)hMenu);
-    HMENU hFileMenu = CreatePopupMenu();
-    DBG_LOGF("CreatePopupMenu() for File returned %p", (void*)hFileMenu);
-    HMENU hHelpMenu = CreatePopupMenu();
-    DBG_LOGF("CreatePopupMenu() for Help returned %p", (void*)hHelpMenu);
+void centerDialogOverOwner(HWND dialog)
+{
+    HWND owner = GetParent(dialog);
+    RECT dialogRect{};
+    GetWindowRect(dialog, &dialogRect);
 
-    DBG_LOG("Adding File menu items...");
-    AppendMenu(hFileMenu, MF_STRING, static_cast<UINT>(MenuCommands::MC_FILE_OPEN), L"Open");
-    AppendMenu(hFileMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hFileMenu, MF_STRING, static_cast<UINT>(MenuCommands::MC_FILE_SAVE), L"Save");
-    AppendMenu(hFileMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hFileMenu, MF_STRING, static_cast<UINT>(MenuCommands::MC_FILE_EXIT), L"Exit");
-    DBG_LOG("Adding Help menu items...");
-    AppendMenu(hHelpMenu, MF_STRING, static_cast<UINT>(MenuCommands::MC_HELP_ABOUT), L"About");
+    RECT targetRect{};
+    if (owner && GetWindowRect(owner, &targetRect))
+    {
+    }
+    else
+    {
+        targetRect.left = 0;
+        targetRect.top = 0;
+        targetRect.right = GetSystemMetrics(SM_CXSCREEN);
+        targetRect.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
 
-    DBG_LOG("Appending menus to menu bar...");
-    AppendMenu(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hFileMenu), L"File");
-    AppendMenu(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hHelpMenu), L"Help");
+    const int dialogWidth = dialogRect.right - dialogRect.left;
+    const int dialogHeight = dialogRect.bottom - dialogRect.top;
+    const int x = targetRect.left + ((targetRect.right - targetRect.left) - dialogWidth) / 2;
+    const int y = targetRect.top + ((targetRect.bottom - targetRect.top) - dialogHeight) / 2;
 
-    DBG_LOG("Calling SetMenu()...");
-    SetMenu(hwnd, hMenu);
-    DBG_LOG("initMenu() complete");
+    SetWindowPos(dialog, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
 }
 
-/*
-===============================================================================
-Function Name: AboutDialogProc
-
-Description:
-    - Handles the About dialog box messages.
-    - Displays information about the application.
-
-Parameters:
-    - hDlg: Handle to the dialog box.
-    - message: Message identifier.
-    - wParam: Additional message information.
-    - lParam: Additional message information.
-===============================================================================
-*/
-LRESULT CALLBACK AboutDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+void initMenu(HWND hwnd)
 {
-    (void)lParam;
+    HMENU menuBar = CreateMenu();
+    HMENU fileMenu = CreatePopupMenu();
+    HMENU viewMenu = CreatePopupMenu();
+    HMENU helpMenu = CreatePopupMenu();
+
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN, L"Open PNG...");
+    AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, L"Exit");
+    AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_GRID, L"Grid");
+    AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_RULERS, L"Rulers");
+    AppendMenuW(helpMenu, MF_STRING, IDM_HELP_ABOUT, L"About SIMP");
+
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"File");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(viewMenu), L"View");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(helpMenu), L"Help");
+    updateCanvasCaliperMenu(menuBar);
+
+    SetMenu(hwnd, menuBar);
+    DrawMenuBar(hwnd);
+}
+
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+{
     switch (message)
     {
     case WM_INITDIALOG:
     {
+        const std::wstring aboutText = L"SIMP\nSimple Image Manipulation Program\nVersion " APP_VERSION_WSTRING;
         g_menuActive = true;
-        KillTimer(g_hwnd, 0x7C0B);
-        HWND hParent = GetParent(hDlg);
-        if (hParent)
-        {
-            RECT dlgRect, parentClient;
-            GetWindowRect(hDlg, &dlgRect);
-            GetClientRect(hParent, &parentClient);
-            POINT pt = {parentClient.left, parentClient.top};
-            ClientToScreen(hParent, &pt);
-            OffsetRect(&parentClient, pt.x, pt.y);
-            int x = parentClient.left + ((parentClient.right - parentClient.left) - (dlgRect.right - dlgRect.left)) / 2;
-            int y = parentClient.top + ((parentClient.bottom - parentClient.top) - (dlgRect.bottom - dlgRect.top)) / 2;
-            SetWindowPos(hDlg, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        }
-        HICON hIcon = static_cast<HICON>(LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
-        SendDlgItemMessage(hDlg, IDC_ABOUT_ICON, STM_SETICON, reinterpret_cast<WPARAM>(hIcon), 0);
+        SetDlgItemTextW(dialog, IDC_ABOUT_TEXT, aboutText.c_str());
+        applyWindowTheme(dialog);
+        centerDialogOverOwner(dialog);
         return TRUE;
     }
+
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             g_menuActive = false;
-            EndDialog(hDlg, LOWORD(wParam));
+            EndDialog(dialog, 0);
             return TRUE;
         }
         break;
+
     case WM_CLOSE:
         g_menuActive = false;
-        EndDialog(hDlg, IDCANCEL);
+        EndDialog(dialog, 0);
         return TRUE;
     }
+
     return FALSE;
 }
 
-/*
-===============================================================================
-Function Name: HandleMenuCommand
-
-Description:
-    - Handles menu commands from the main window.
-    - Processes commands for File and Help menus.
-
-Parameters:
-    - hwnd: Handle to the main window.
-    - wParam: Command identifier from the menu selection.
-===============================================================================
-*/
-LRESULT HandleMenuCommand(HWND hwnd, WPARAM wParam)
+LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam)
 {
-    switch (static_cast<int>(LOWORD(wParam)))
+    switch (LOWORD(wParam))
     {
-    case static_cast<int>(MenuCommands::MC_FILE_OPEN):
-        MessageBox(hwnd, L"Open selected", L"File Menu", MB_OK);
-        break;
-    case static_cast<int>(MenuCommands::MC_FILE_SAVE):
-        MessageBox(hwnd, L"Save selected", L"File Menu", MB_OK);
-        break;
-    case static_cast<int>(MenuCommands::MC_FILE_EXIT):
-        save_config("config.json");
-        ::PostQuitMessage(0);
-        break;
-    case static_cast<int>(MenuCommands::MC_HELP_ABOUT):
-        DialogBox(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDD_ABOUT_DIALOG), hwnd, AboutDialogProc);
-        break;
+    case IDM_FILE_OPEN:
+        openCanvasCaliperPngDialog(hwnd);
+        return 0;
+
+    case IDM_FILE_EXIT:
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+
+    case IDM_VIEW_GRID:
+        setCanvasCaliperGridVisible(!canvasCaliperGridVisible());
+        DrawMenuBar(hwnd);
+        return 0;
+
+    case IDM_VIEW_RULERS:
+        setCanvasCaliperRulersVisible(!canvasCaliperRulersVisible());
+        DrawMenuBar(hwnd);
+        return 0;
+
+    case IDM_HELP_ABOUT:
+        DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_ABOUT_DIALOG), hwnd, AboutDialogProc, 0);
+        requestRender();
+        return 0;
     }
+
     return 0;
 }
