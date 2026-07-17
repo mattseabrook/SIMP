@@ -46,8 +46,7 @@ void throwIfFailed(VkResult result, const char* message)
 
 std::uint32_t findMemoryType(std::uint32_t typeFilter, VkMemoryPropertyFlags properties)
 {
-    VkPhysicalDeviceMemoryProperties memoryProperties{};
-    vkGetPhysicalDeviceMemoryProperties(vkCtx.physicalDevice, &memoryProperties);
+    const VkPhysicalDeviceMemoryProperties& memoryProperties = vkCtx.memoryProperties;
 
     for (std::uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index)
     {
@@ -427,6 +426,7 @@ void pickPhysicalDevice()
         if (isPhysicalDeviceSuitable(device))
         {
             vkCtx.physicalDevice = device;
+            vkGetPhysicalDeviceMemoryProperties(device, &vkCtx.memoryProperties);
             return;
         }
     }
@@ -533,6 +533,7 @@ void createSwapchain()
     vkGetSwapchainImagesKHR(vkCtx.device, vkCtx.swapchain, &imageCount, nullptr);
     vkCtx.swapchainImages.resize(imageCount);
     vkGetSwapchainImagesKHR(vkCtx.device, vkCtx.swapchain, &imageCount, vkCtx.swapchainImages.data());
+    vkCtx.imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
 
     vkCtx.swapchainFormat = surfaceFormat.format;
     vkCtx.swapchainExtent = extent;
@@ -710,6 +711,7 @@ void cleanupSwapchain()
     }
 
     vkCtx.swapchainImages.clear();
+    vkCtx.imagesInFlight.clear();
 }
 
 void recreateSwapchain(std::uint32_t width, std::uint32_t height)
@@ -984,6 +986,14 @@ void renderFrameVk()
 
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
         throw std::runtime_error("Failed to acquire a Vulkan swapchain image.");
+
+    if (vkCtx.imagesInFlight[imageIndex] != VK_NULL_HANDLE)
+    {
+        throwIfFailed(
+            vkWaitForFences(vkCtx.device, 1, &vkCtx.imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX),
+            "Failed to wait for a Vulkan swapchain image fence.");
+    }
+    vkCtx.imagesInFlight[imageIndex] = vkCtx.inFlightFences[vkCtx.currentFrame];
 
     throwIfFailed(vkResetFences(vkCtx.device, 1, &vkCtx.inFlightFences[vkCtx.currentFrame]), "Failed to reset the Vulkan frame fence.");
     throwIfFailed(vkResetCommandBuffer(vkCtx.commandBuffers[vkCtx.currentFrame], 0), "Failed to reset a Vulkan command buffer.");

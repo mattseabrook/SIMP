@@ -483,10 +483,19 @@ void buildOverlayGeometry(CanvasRenderData& data, std::uint32_t width, std::uint
     const double canvasRight = originX + canvasWidth;
     const double canvasBottom = originY + canvasHeight;
 
+    const std::size_t gridColumns = static_cast<std::size_t>(std::floor(g_state.canvasWidthIn / std::max(0.001, g_state.gridSizeIn))) + 1;
+    const std::size_t gridRows = static_cast<std::size_t>(std::floor(g_state.canvasHeightIn / std::max(0.001, g_state.gridSizeIn))) + 1;
+    const std::size_t gridReserve = g_state.showGrid ? gridColumns + gridRows + 4 : 0;
+
     if (g_state.showRulers)
     {
         const double maxRulerXIn = std::max({g_state.canvasWidthIn, g_state.hasImage ? g_state.offsetXIn + g_state.imageWidthIn : 0.0, 0.0});
         const double maxRulerYIn = std::max({g_state.canvasHeightIn, g_state.hasImage ? g_state.offsetYIn + g_state.imageHeightIn : 0.0, 0.0});
+
+        const std::size_t tickCountX = static_cast<std::size_t>(std::floor(maxRulerXIn / 0.25)) + 1;
+        const std::size_t tickCountY = static_cast<std::size_t>(std::floor(maxRulerYIn / 0.25)) + 1;
+        data.overlays.reserve(data.overlays.size() + tickCountX + tickCountY + 3 + gridReserve);
+
         addOverlayRectD(data, originX, originY - kRulerThickness, maxRulerXIn * pxPerIn, kRulerThickness, rulerBackground, width, height);
         addOverlayRectD(data, originX - kRulerThickness, originY, kRulerThickness, maxRulerYIn * pxPerIn, rulerBackground, width, height);
 
@@ -519,9 +528,12 @@ void buildOverlayGeometry(CanvasRenderData& data, std::uint32_t width, std::uint
     if (!g_state.showGrid)
         return;
 
+    if (!g_state.showRulers)
+        data.overlays.reserve(data.overlays.size() + gridReserve);
+
     const double gridStep = std::max(0.001, g_state.gridSizeIn) * pxPerIn;
-    const int fullColumns = static_cast<int>(std::floor(g_state.canvasWidthIn / std::max(0.001, g_state.gridSizeIn)));
-    const int fullRows = static_cast<int>(std::floor(g_state.canvasHeightIn / std::max(0.001, g_state.gridSizeIn)));
+    const int fullColumns = static_cast<int>(gridColumns) - 1;
+    const int fullRows = static_cast<int>(gridRows) - 1;
 
     for (int column = 0; column <= fullColumns; ++column)
     {

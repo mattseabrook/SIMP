@@ -33,6 +33,8 @@ struct VulkanContext
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
+    std::vector<VkFence> imagesInFlight;
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent{};
     std::uint32_t graphicsQueueFamily = 0;
