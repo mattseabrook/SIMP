@@ -33,6 +33,8 @@ constexpr int kFloatingRightHeight = 650;
 constexpr int kRulerThickness = 28;
 constexpr double kMaxZoom = 32.0;
 constexpr double kZoomStep = 1.25;
+constexpr int kTopToolbarHeight = 34;
+constexpr int kTopToolbarIconSlot = 34;
 
 enum ControlId : UINT
 {
@@ -125,6 +127,7 @@ struct CanvasLayout
     double contentMaxYIn = 1.0;
     int leftInset = 0;
     int rightInset = 0;
+    int topInset = kTopToolbarHeight;
 };
 
 struct ToolPanel
@@ -173,8 +176,8 @@ struct DragState
 
 CanvasState g_state;
 CanvasLayout g_layout;
-ToolPanel g_leftPanel{ToolbarKind::Left, ToolbarDock::Left, nullptr, {kLeftPanelWidth, kFloatingLeftHeight}, {0, 0, kLeftPanelWidth, kFloatingLeftHeight}};
-ToolPanel g_rightPanel{ToolbarKind::Right, ToolbarDock::Right, nullptr, {kRightPanelWidth, kFloatingRightHeight}, {0, 0, kRightPanelWidth, kFloatingRightHeight}};
+ToolPanel g_leftPanel{ToolbarKind::Left, ToolbarDock::Left, nullptr, {kLeftPanelWidth, kFloatingLeftHeight}, {0, kTopToolbarHeight, kLeftPanelWidth, kTopToolbarHeight + kFloatingLeftHeight}};
+ToolPanel g_rightPanel{ToolbarKind::Right, ToolbarDock::Right, nullptr, {kRightPanelWidth, kFloatingRightHeight}, {0, kTopToolbarHeight, kRightPanelWidth, kTopToolbarHeight + kFloatingRightHeight}};
 LeftControls g_controls;
 DragState g_drag;
 HWND g_parent = nullptr;
@@ -409,6 +412,7 @@ bool handlePanelCommand(WPARAM wParam, LPARAM lParam);
 void snapToolPanel(ToolPanel& panel);
 void moveFloatingToolPanel(ToolPanel& panel, const RECT& rect);
 LRESULT CALLBACK ToolPanelProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+void ensureToolbarTexture(std::uint32_t width);
 
 CanvasLayout computeLayout(std::uint32_t width, std::uint32_t height)
 {
@@ -420,6 +424,7 @@ CanvasLayout computeLayout(std::uint32_t width, std::uint32_t height)
         layout.rightInset = g_rightPanel.preferredSize.cx;
 
     const int ruler = g_state.showRulers ? kRulerThickness : 0;
+    const int topInset = layout.topInset;
     layout.contentMinXIn = std::min(0.0, g_state.hasImage ? g_state.offsetXIn : 0.0);
     layout.contentMinYIn = std::min(0.0, g_state.hasImage ? g_state.offsetYIn : 0.0);
     layout.contentMaxXIn = std::max(g_state.canvasWidthIn, g_state.hasImage ? g_state.offsetXIn + g_state.imageWidthIn : g_state.canvasWidthIn);
@@ -428,12 +433,12 @@ CanvasLayout computeLayout(std::uint32_t width, std::uint32_t height)
     const double contentWidthIn = std::max(0.01, layout.contentMaxXIn - layout.contentMinXIn);
     const double contentHeightIn = std::max(0.01, layout.contentMaxYIn - layout.contentMinYIn);
     const double availableWidth = std::max(80.0, static_cast<double>(width - std::min<std::uint32_t>(width, layout.leftInset + layout.rightInset + ruler)));
-    const double availableHeight = std::max(80.0, static_cast<double>(height > static_cast<std::uint32_t>(ruler) ? height - ruler : height));
+    const double availableHeight = std::max(80.0, static_cast<double>(height - std::min<std::uint32_t>(height, static_cast<std::uint32_t>(topInset) + ruler)));
 
     layout.fitPxPerIn = std::min(availableWidth / contentWidthIn, availableHeight / contentHeightIn);
     layout.pxPerIn = std::max(1.0, layout.fitPxPerIn * g_state.zoomScale);
     layout.originX = static_cast<double>(layout.leftInset + ruler) - layout.contentMinXIn * layout.pxPerIn;
-    layout.originY = static_cast<double>(ruler) - layout.contentMinYIn * layout.pxPerIn;
+    layout.originY = static_cast<double>(topInset + ruler) - layout.contentMinYIn * layout.pxPerIn;
     return layout;
 }
 
@@ -750,6 +755,141 @@ void computePalette()
         }
     }
 }
+
+// The top toolbar is Vulkan-rendered (not a Win32 toolbar control): there is no
+// text/glyph pipeline in the renderer yet, so the strip is rasterized once with
+// GDI (background fill + placeholder emoji "icons") into an off-screen bitmap,
+// uploaded as a Vulkan texture, and blitted onto the swapchain every frame the
+// same way the canvas image is. It only needs to be regenerated when the window
+// width (or menu color) changes, not every frame.
+struct ToolbarIconSpec
+{
+    const wchar_t* glyph;
+};
+
+// Rough-in placeholders standing in for real tool icons later on. First slot is
+// the pointer/selection tool per the initial design direction.
+constexpr std::array<ToolbarIconSpec, 8> kToolbarIcons = {{
+    {L"\U0001F5B1"},  // pointer / selection
+    {L"\U0001F590"},  // pan / hand
+    {L"\U0001F58C"},  // brush
+    {L"\U0001FAA3"},  // fill bucket
+    {L"\U0001F9FD"},  // eraser
+    {L"\U0001F50D"},  // zoom
+    {L"\U0001F4D0"},  // ruler / caliper
+    {L"\U0001F3A8"},  // palette / color
+}};
+
+HFONT g_toolbarIconFont = nullptr;
+std::uint32_t g_toolbarTextureWidth = 0;
+
+void renderToolbarBitmap(std::uint32_t width, DecodedImage& outImage)
+{
+    outImage = {};
+    if (width == 0)
+        return;
+
+    const UINT bitmapWidth = width;
+    const UINT bitmapHeight = static_cast<UINT>(kTopToolbarHeight);
+
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(bitmapWidth);
+    bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(bitmapHeight);
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc)
+        return;
+    HDC memoryDc = CreateCompatibleDC(screenDc);
+    ReleaseDC(nullptr, screenDc);
+    if (!memoryDc)
+        return;
+
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(memoryDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bitmap || !pixels)
+    {
+        if (bitmap)
+            DeleteObject(bitmap);
+        DeleteDC(memoryDc);
+        return;
+    }
+
+    HGDIOBJ previousBitmap = SelectObject(memoryDc, bitmap);
+
+    // Match whatever the OS is actually rendering for the native menu bar above
+    // this strip, so the boundary between the two reads as one continuous bar.
+    const COLORREF menuColor = GetSysColor(COLOR_MENUBAR);
+    RECT fullRect{0, 0, static_cast<int>(bitmapWidth), static_cast<int>(bitmapHeight)};
+    HBRUSH menuBrush = CreateSolidBrush(menuColor);
+    FillRect(memoryDc, &fullRect, menuBrush);
+    DeleteObject(menuBrush);
+
+    if (!g_toolbarIconFont)
+    {
+        LOGFONTW font{};
+        font.lfHeight = -20;
+        font.lfWeight = FW_NORMAL;
+        font.lfCharSet = DEFAULT_CHARSET;
+        font.lfQuality = CLEARTYPE_QUALITY;
+        wcscpy_s(font.lfFaceName, LF_FACESIZE, L"Segoe UI Emoji");
+        g_toolbarIconFont = CreateFontIndirectW(&font);
+    }
+
+    HGDIOBJ previousFont = g_toolbarIconFont ? SelectObject(memoryDc, g_toolbarIconFont) : nullptr;
+    SetBkMode(memoryDc, TRANSPARENT);
+    SetTextColor(memoryDc, RGB(235, 235, 235));
+
+    for (std::size_t index = 0; index < kToolbarIcons.size(); ++index)
+    {
+        const int slotLeft = static_cast<int>(index) * kTopToolbarIconSlot;
+        if (slotLeft >= static_cast<int>(bitmapWidth))
+            break;
+
+        RECT slotRect{slotLeft, 0, std::min(static_cast<int>(bitmapWidth), slotLeft + kTopToolbarIconSlot), static_cast<int>(bitmapHeight)};
+        DrawTextW(memoryDc, kToolbarIcons[index].glyph, -1, &slotRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+    }
+
+    if (previousFont)
+        SelectObject(memoryDc, previousFont);
+    SelectObject(memoryDc, previousBitmap);
+
+    outImage.width = bitmapWidth;
+    outImage.height = bitmapHeight;
+    outImage.pixels.resize(static_cast<std::size_t>(bitmapWidth) * bitmapHeight * 4);
+    std::memcpy(outImage.pixels.data(), pixels, outImage.pixels.size());
+    for (std::size_t index = 3; index < outImage.pixels.size(); index += 4)
+        outImage.pixels[index] = 255;
+
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
+}
+
+void ensureToolbarTexture(std::uint32_t width)
+{
+    if (width == 0 || width == g_toolbarTextureWidth)
+        return;
+
+    DecodedImage image;
+    renderToolbarBitmap(width, image);
+    if (image.width == 0)
+        return;
+
+    setVulkanToolbarImage(image);
+    g_toolbarTextureWidth = width;
+}
+}
+
+void invalidateCanvasCaliperToolbar()
+{
+    g_toolbarTextureWidth = 0;
+}
+
+namespace
+{
 
 void applyPngSpecsToState()
 {
@@ -1068,7 +1208,7 @@ void snapToolPanel(ToolPanel& panel)
         const int width = rect.right - rect.left;
         const int height = rect.bottom - rect.top;
         rect.left = std::clamp<LONG>(rect.left, 0, std::max<LONG>(0, client.right - width));
-        rect.top = std::clamp<LONG>(rect.top, 0, std::max<LONG>(0, client.bottom - height));
+        rect.top = std::clamp<LONG>(rect.top, kTopToolbarHeight, std::max<LONG>(kTopToolbarHeight, client.bottom - height));
         rect.right = rect.left + width;
         rect.bottom = rect.top + height;
         panel.floatingRect = rect;
@@ -1466,17 +1606,19 @@ void layoutCanvasCaliperChrome()
     const int clientWidth = client.right - client.left;
     const int clientHeight = client.bottom - client.top;
 
+    const int panelAreaHeight = std::max(0, clientHeight - kTopToolbarHeight);
+
     auto layoutPanel = [&](ToolPanel& panel) {
         if (!panel.hwnd)
             return;
 
         if (panel.dock == ToolbarDock::Left)
         {
-            MoveWindow(panel.hwnd, 0, 0, panel.preferredSize.cx, clientHeight, TRUE);
+            MoveWindow(panel.hwnd, 0, kTopToolbarHeight, panel.preferredSize.cx, panelAreaHeight, TRUE);
         }
         else if (panel.dock == ToolbarDock::Right)
         {
-            MoveWindow(panel.hwnd, clientWidth - panel.preferredSize.cx, 0, panel.preferredSize.cx, clientHeight, TRUE);
+            MoveWindow(panel.hwnd, clientWidth - panel.preferredSize.cx, kTopToolbarHeight, panel.preferredSize.cx, panelAreaHeight, TRUE);
         }
         else
         {
@@ -1484,7 +1626,7 @@ void layoutCanvasCaliperChrome()
             const int width = rect.right - rect.left;
             const int height = rect.bottom - rect.top;
             rect.left = std::clamp<LONG>(rect.left, 0, std::max<LONG>(0, clientWidth - width));
-            rect.top = std::clamp<LONG>(rect.top, 0, std::max<LONG>(0, clientHeight - height));
+            rect.top = std::clamp<LONG>(rect.top, kTopToolbarHeight, std::max<LONG>(kTopToolbarHeight, clientHeight - height));
             rect.right = rect.left + width;
             rect.bottom = rect.top + height;
             panel.floatingRect = rect;
@@ -1711,6 +1853,8 @@ void updateCanvasCaliperMenu(HMENU menu)
 
 CanvasRenderData buildCanvasRenderData(std::uint32_t width, std::uint32_t height)
 {
+    ensureToolbarTexture(width);
+
     CanvasRenderData data;
     g_layout = computeLayout(width, height);
 

@@ -46,6 +46,10 @@ struct VulkanContext
     VkDeviceMemory canvasImageMemory = VK_NULL_HANDLE;
     std::uint32_t canvasImageWidth = 0;
     std::uint32_t canvasImageHeight = 0;
+    VkImage toolbarImage = VK_NULL_HANDLE;
+    VkDeviceMemory toolbarImageMemory = VK_NULL_HANDLE;
+    std::uint32_t toolbarImageWidth = 0;
+    std::uint32_t toolbarImageHeight = 0;
     bool framebufferResized = false;
     bool initialized = false;
 };
@@ -56,6 +60,7 @@ void initializeVulkan(HWND hwnd);
 void resizeVulkan(std::uint32_t width, std::uint32_t height);
 void setVulkanCanvasImage(const DecodedImage& image);
 void clearVulkanCanvasImage();
+void setVulkanToolbarImage(const DecodedImage& image);
 void renderFrameVk();
 void cleanupVulkan();
 

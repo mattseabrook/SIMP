@@ -225,22 +225,32 @@ void copyBufferToImage(VkBuffer buffer, VkImage image, std::uint32_t width, std:
     endSingleTimeCommands(commandBuffer);
 }
 
+void destroyGpuImage(VkImage& image, VkDeviceMemory& memory, std::uint32_t& width, std::uint32_t& height)
+{
+    if (image)
+    {
+        vkDestroyImage(vkCtx.device, image, nullptr);
+        image = VK_NULL_HANDLE;
+    }
+
+    if (memory)
+    {
+        vkFreeMemory(vkCtx.device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+    }
+
+    width = 0;
+    height = 0;
+}
+
 void destroyCanvasTexture()
 {
-    if (vkCtx.canvasImage)
-    {
-        vkDestroyImage(vkCtx.device, vkCtx.canvasImage, nullptr);
-        vkCtx.canvasImage = VK_NULL_HANDLE;
-    }
+    destroyGpuImage(vkCtx.canvasImage, vkCtx.canvasImageMemory, vkCtx.canvasImageWidth, vkCtx.canvasImageHeight);
+}
 
-    if (vkCtx.canvasImageMemory)
-    {
-        vkFreeMemory(vkCtx.device, vkCtx.canvasImageMemory, nullptr);
-        vkCtx.canvasImageMemory = VK_NULL_HANDLE;
-    }
-
-    vkCtx.canvasImageWidth = 0;
-    vkCtx.canvasImageHeight = 0;
+void destroyToolbarTexture()
+{
+    destroyGpuImage(vkCtx.toolbarImage, vkCtx.toolbarImageMemory, vkCtx.toolbarImageWidth, vkCtx.toolbarImageHeight);
 }
 
 QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device)
@@ -807,6 +817,61 @@ void blitCanvasImageToSwapchain(VkCommandBuffer commandBuffer, VkImage swapchain
         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
+void blitToolbarImageToSwapchain(VkCommandBuffer commandBuffer, VkImage swapchainImage)
+{
+    if (!vkCtx.toolbarImage || vkCtx.toolbarImageWidth == 0 || vkCtx.toolbarImageHeight == 0)
+        return;
+
+    const std::int32_t dstWidth = std::min(static_cast<std::int32_t>(vkCtx.toolbarImageWidth), static_cast<std::int32_t>(vkCtx.swapchainExtent.width));
+    const std::int32_t dstHeight = std::min(static_cast<std::int32_t>(vkCtx.toolbarImageHeight), static_cast<std::int32_t>(vkCtx.swapchainExtent.height));
+    if (dstWidth <= 0 || dstHeight <= 0)
+        return;
+
+    VkImageBlit blit{};
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.mipLevel = 0;
+    blit.srcSubresource.baseArrayLayer = 0;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[0] = {0, 0, 0};
+    blit.srcOffsets[1] = {dstWidth, dstHeight, 1};
+    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.dstSubresource.mipLevel = 0;
+    blit.dstSubresource.baseArrayLayer = 0;
+    blit.dstSubresource.layerCount = 1;
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {dstWidth, dstHeight, 1};
+
+    transitionImageLayout(
+        commandBuffer,
+        swapchainImage,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT);
+
+    vkCmdBlitImage(
+        commandBuffer,
+        vkCtx.toolbarImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        swapchainImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &blit,
+        VK_FILTER_NEAREST);
+
+    transitionImageLayout(
+        commandBuffer,
+        swapchainImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+}
+
 void drawOverlayRects(VkCommandBuffer commandBuffer, const CanvasRenderData& renderData)
 {
     for (const CanvasOverlayRect& rect : renderData.overlays)
@@ -854,6 +919,7 @@ void recordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex
     vkCmdEndRenderPass(commandBuffer);
 
     blitCanvasImageToSwapchain(commandBuffer, vkCtx.swapchainImages.at(imageIndex), renderData);
+    blitToolbarImageToSwapchain(commandBuffer, vkCtx.swapchainImages.at(imageIndex));
 
     VkRenderPassBeginInfo overlayRenderPassInfo{};
     overlayRenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -905,14 +971,8 @@ void resizeVulkan(std::uint32_t width, std::uint32_t height)
     vkCtx.framebufferResized = true;
 }
 
-void setVulkanCanvasImage(const DecodedImage& image)
+static void uploadDecodedImageToTexture(const DecodedImage& image, VkImage& outImage, VkDeviceMemory& outMemory, std::uint32_t& outWidth, std::uint32_t& outHeight)
 {
-    if (!vkCtx.initialized || image.width == 0 || image.height == 0 || image.pixels.empty())
-        return;
-
-    vkDeviceWaitIdle(vkCtx.device);
-    destroyCanvasTexture();
-
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(image.width) * static_cast<VkDeviceSize>(image.height) * 4;
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
@@ -933,15 +993,25 @@ void setVulkanCanvasImage(const DecodedImage& image)
         image.height,
         VK_FORMAT_B8G8R8A8_UNORM,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        vkCtx.canvasImage,
-        vkCtx.canvasImageMemory);
+        outImage,
+        outMemory);
 
-    copyBufferToImage(stagingBuffer, vkCtx.canvasImage, image.width, image.height);
+    copyBufferToImage(stagingBuffer, outImage, image.width, image.height);
     vkDestroyBuffer(vkCtx.device, stagingBuffer, nullptr);
     vkFreeMemory(vkCtx.device, stagingMemory, nullptr);
 
-    vkCtx.canvasImageWidth = image.width;
-    vkCtx.canvasImageHeight = image.height;
+    outWidth = image.width;
+    outHeight = image.height;
+}
+
+void setVulkanCanvasImage(const DecodedImage& image)
+{
+    if (!vkCtx.initialized || image.width == 0 || image.height == 0 || image.pixels.empty())
+        return;
+
+    vkDeviceWaitIdle(vkCtx.device);
+    destroyCanvasTexture();
+    uploadDecodedImageToTexture(image, vkCtx.canvasImage, vkCtx.canvasImageMemory, vkCtx.canvasImageWidth, vkCtx.canvasImageHeight);
 }
 
 void clearVulkanCanvasImage()
@@ -951,6 +1021,16 @@ void clearVulkanCanvasImage()
 
     vkDeviceWaitIdle(vkCtx.device);
     destroyCanvasTexture();
+}
+
+void setVulkanToolbarImage(const DecodedImage& image)
+{
+    if (!vkCtx.initialized || image.width == 0 || image.height == 0 || image.pixels.empty())
+        return;
+
+    vkDeviceWaitIdle(vkCtx.device);
+    destroyToolbarTexture();
+    uploadDecodedImageToTexture(image, vkCtx.toolbarImage, vkCtx.toolbarImageMemory, vkCtx.toolbarImageWidth, vkCtx.toolbarImageHeight);
 }
 
 void renderFrameVk()
@@ -1044,6 +1124,7 @@ void cleanupVulkan()
     vkDeviceWaitIdle(vkCtx.device);
 
     destroyCanvasTexture();
+    destroyToolbarTexture();
 
     for (VkFence fence : vkCtx.inFlightFences)
         vkDestroyFence(vkCtx.device, fence, nullptr);

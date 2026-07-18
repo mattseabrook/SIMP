@@ -400,6 +400,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_SYSCOLORCHANGE:
         refreshThemePalette();
         applyWindowTheme(hwnd);
+        invalidateCanvasCaliperToolbar();
         requestRender();
         return 0;
 

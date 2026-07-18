@@ -31,6 +31,7 @@ struct CanvasRenderData
 void initializeCanvasCaliper(HWND hwnd);
 void shutdownCanvasCaliper();
 void layoutCanvasCaliperChrome();
+void invalidateCanvasCaliperToolbar();
 void loadCanvasCaliperConfig();
 void saveCanvasCaliperConfig();
 void openCanvasCaliperImageDialog(HWND owner);
