@@ -36,6 +36,8 @@ void loadCanvasCaliperConfig();
 void saveCanvasCaliperConfig();
 void openCanvasCaliperImageDialog(HWND owner);
 bool loadCanvasCaliperImagePath(HWND owner, const wchar_t* path);
+void openCanvasCaliperDocumentDialog(HWND owner);
+void saveCanvasCaliperDocumentAsDialog(HWND owner);
 void clearCanvasCaliperImage();
 bool handleCanvasCaliperCommand(HWND hwnd, WPARAM wParam, LPARAM lParam);
 bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);

@@ -54,7 +54,10 @@ void initMenu(HWND hwnd)
     HMENU viewMenu = CreatePopupMenu();
     HMENU helpMenu = CreatePopupMenu();
 
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN, L"Open PNG...");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN, L"Open Image...");
+    AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN_DOCUMENT, L"Open SIMP Document...");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_SAVE_DOCUMENT_AS, L"Save SIMP Document As...");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, L"Exit");
     AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_GRID, L"Grid");
@@ -119,6 +122,14 @@ LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam)
     {
     case IDM_FILE_OPEN:
         openCanvasCaliperImageDialog(hwnd);
+        return 0;
+
+    case IDM_FILE_OPEN_DOCUMENT:
+        openCanvasCaliperDocumentDialog(hwnd);
+        return 0;
+
+    case IDM_FILE_SAVE_DOCUMENT_AS:
+        saveCanvasCaliperDocumentAsDialog(hwnd);
         return 0;
 
     case IDM_FILE_EXIT:

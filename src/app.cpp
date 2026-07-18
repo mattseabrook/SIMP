@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "menu.h"
+#include "simpformat.h"
 #include "system.h"
 #include "vulkan.h"
 #include "window.h"
@@ -1057,7 +1058,7 @@ void createLeftPanelControls(HWND parent)
     makeButton(parent, IDC_CC_ZOOM_IN, L"Zoom +", 122, y, 104, 25);
     y += 31;
     makeButton(parent, IDC_CC_CLEAR, L"Clear", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_SAVE, L"Save", 122, y, 104, 25);
+    makeButton(parent, IDC_CC_SAVE, L"Apply", 122, y, 104, 25);
     y += 35;
 
     makeStatic(parent, L"View", 10, y, 210, 14);
@@ -1719,6 +1720,99 @@ void clearCanvasCaliperImage()
     clearVulkanCanvasImage();
     syncControlsFromState();
     requestCanvasRender();
+}
+
+void openCanvasCaliperDocumentDialog(HWND owner)
+{
+    wchar_t filename[MAX_PATH] = {};
+    OPENFILENAMEW open{};
+    open.lStructSize = sizeof(open);
+    open.hwndOwner = owner;
+    open.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0All Files (*.*)\0*.*\0";
+    open.lpstrFile = filename;
+    open.nMaxFile = static_cast<DWORD>(std::size(filename));
+    open.lpstrTitle = L"Open SIMP Document";
+    open.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    open.lpstrDefExt = L"simp";
+
+    if (!GetOpenFileNameW(&open))
+        return;
+
+    SimpDocument document;
+    if (!loadSimpDocument(filename, document))
+    {
+        MessageBoxW(owner, L"Could not read that SIMP document.", L"SIMP", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    g_state.canvasWidthIn = clampDouble(document.canvasWidthIn, 0.01, 10000.0);
+    g_state.canvasHeightIn = clampDouble(document.canvasHeightIn, 0.01, 10000.0);
+    g_state.gridSizeIn = clampDouble(document.gridSizeIn, 0.01, 10000.0);
+    g_state.majorEvery = std::clamp(document.majorEvery, 0, 10000);
+    g_state.paletteCount = std::clamp(document.paletteCount, 8, 64);
+    g_state.showGrid = document.showGrid;
+    g_state.showRulers = document.showRulers;
+
+    if (document.hasLayer)
+    {
+        g_state.image = std::move(document.layerImage);
+        g_state.hasImage = true;
+        g_state.imagePath.clear();
+        g_state.imageName = document.layerName;
+        g_state.imagePpi = clampDouble(document.layerPpi, 1.0, 5000.0);
+        g_state.detectedPpi = g_state.imagePpi;
+        g_state.ppiSource = L"document";
+        g_state.offsetXIn = snapQuarter(document.layerOffsetXIn);
+        g_state.offsetYIn = snapQuarter(document.layerOffsetYIn);
+        applyPngSpecsToState();
+        computePalette();
+        setVulkanCanvasImage(g_state.image);
+        syncControlsFromState();
+        requestCanvasRender();
+    }
+    else
+    {
+        clearCanvasCaliperImage();
+    }
+}
+
+void saveCanvasCaliperDocumentAsDialog(HWND owner)
+{
+    wchar_t filename[MAX_PATH] = {};
+    OPENFILENAMEW save{};
+    save.lStructSize = sizeof(save);
+    save.hwndOwner = owner;
+    save.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0All Files (*.*)\0*.*\0";
+    save.lpstrFile = filename;
+    save.nMaxFile = static_cast<DWORD>(std::size(filename));
+    save.lpstrTitle = L"Save SIMP Document As";
+    save.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    save.lpstrDefExt = L"simp";
+
+    if (!GetSaveFileNameW(&save))
+        return;
+
+    SimpDocument document;
+    document.canvasWidthIn = g_state.canvasWidthIn;
+    document.canvasHeightIn = g_state.canvasHeightIn;
+    document.gridSizeIn = g_state.gridSizeIn;
+    document.majorEvery = g_state.majorEvery;
+    document.paletteCount = g_state.paletteCount;
+    document.showGrid = g_state.showGrid;
+    document.showRulers = g_state.showRulers;
+
+    if (g_state.hasImage)
+    {
+        document.hasLayer = true;
+        document.layerOffsetXIn = g_state.offsetXIn;
+        document.layerOffsetYIn = g_state.offsetYIn;
+        document.layerPpi = g_state.imagePpi;
+        document.layerName = g_state.imageName;
+        document.layerImage = g_state.image;
+    }
+
+    if (!saveSimpDocument(filename, document))
+        MessageBoxW(owner, L"Could not save that SIMP document.", L"SIMP", MB_OK | MB_ICONERROR);
 }
 
 bool handleCanvasCaliperCommand(HWND hwnd, WPARAM wParam, LPARAM lParam)
