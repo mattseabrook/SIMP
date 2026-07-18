@@ -7,6 +7,7 @@
 #include "window.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
@@ -221,10 +222,16 @@ std::wstring filenameOnly(const std::filesystem::path& path)
     return path.filename().wstring();
 }
 
-bool isPngPath(const std::filesystem::path& path)
+bool isSupportedImagePath(const std::filesystem::path& path)
 {
+    constexpr std::array<const wchar_t*, 12> kSupportedExtensions = {
+        L".png", L".jpg", L".jpeg", L".bmp", L".tga", L".gif",
+        L".psd", L".hdr", L".pic", L".pnm", L".ppm", L".pgm"};
+
     const std::wstring extension = path.extension().wstring();
-    return _wcsicmp(extension.c_str(), L".png") == 0;
+    return std::any_of(kSupportedExtensions.begin(), kSupportedExtensions.end(), [&](const wchar_t* candidate) {
+        return _wcsicmp(extension.c_str(), candidate) == 0;
+    });
 }
 
 std::uint32_t readBigEndian32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
@@ -900,8 +907,8 @@ void createLeftPanelControls(HWND parent)
     addEditRow(L"Swatches", g_controls.paletteCount, IDC_CC_PALETTE_COUNT);
 
     y += 8;
-    makeButton(parent, IDC_CC_OPEN, L"Open PNG", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_USE_PNG, L"Use PNG", 122, y, 104, 25);
+    makeButton(parent, IDC_CC_OPEN, L"Open Image", 10, y, 104, 25);
+    makeButton(parent, IDC_CC_USE_PNG, L"Apply PPI", 122, y, 104, 25);
     y += 31;
     makeButton(parent, IDC_CC_RESET_OFFSET, L"Reset Offset", 10, y, 104, 25);
     makeButton(parent, IDC_CC_FIT_VIEW, L"Fit View", 122, y, 104, 25);
@@ -1253,7 +1260,7 @@ bool handlePanelCommand(WPARAM wParam, LPARAM lParam)
     {
     case IDC_CC_OPEN:
         if (notification == BN_CLICKED)
-            openCanvasCaliperPngDialog(g_parent);
+            openCanvasCaliperImageDialog(g_parent);
         return true;
     case IDC_CC_USE_PNG:
         if (notification == BN_CLICKED)
@@ -1490,48 +1497,51 @@ void layoutCanvasCaliperChrome()
     g_layout = computeLayout(static_cast<std::uint32_t>(clientWidth), static_cast<std::uint32_t>(clientHeight));
 }
 
-void openCanvasCaliperPngDialog(HWND owner)
+void openCanvasCaliperImageDialog(HWND owner)
 {
     wchar_t filename[MAX_PATH] = {};
     OPENFILENAMEW open{};
     open.lStructSize = sizeof(open);
     open.hwndOwner = owner;
-    open.lpstrFilter = L"PNG Images (*.png)\0*.png\0All Files (*.*)\0*.*\0";
+    open.lpstrFilter =
+        L"All Supported Images (*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gif;*.psd;*.hdr;*.pic;*.pnm;*.ppm;*.pgm)\0"
+        L"*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gif;*.psd;*.hdr;*.pic;*.pnm;*.ppm;*.pgm\0"
+        L"All Files (*.*)\0*.*\0";
     open.lpstrFile = filename;
     open.nMaxFile = static_cast<DWORD>(std::size(filename));
-    open.lpstrTitle = L"Open PNG";
+    open.lpstrTitle = L"Open Image";
     open.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     open.lpstrDefExt = L"png";
 
     if (GetOpenFileNameW(&open))
-        loadCanvasCaliperPngPath(owner, filename);
+        loadCanvasCaliperImagePath(owner, filename);
 }
 
-bool loadCanvasCaliperPngPath(HWND owner, const wchar_t* path)
+bool loadCanvasCaliperImagePath(HWND owner, const wchar_t* path)
 {
     if (!path || !*path)
         return false;
 
-    const std::filesystem::path pngPath(path);
-    if (!isPngPath(pngPath))
+    const std::filesystem::path imagePath(path);
+    if (!isSupportedImagePath(imagePath))
     {
-        MessageBoxW(owner, L"Please choose a PNG file.", L"SIMP", MB_OK | MB_ICONWARNING);
+        MessageBoxW(owner, L"Please choose a supported image file (PNG, JPEG, BMP, TGA, GIF, PSD, HDR, PIC, or PNM).", L"SIMP", MB_OK | MB_ICONWARNING);
         return false;
     }
 
     DecodedImage decoded;
-    if (!decodePngFileBGRA(pngPath, decoded))
+    if (!decodeImageFileBGRA(imagePath, decoded))
     {
-        MessageBoxW(owner, L"Could not decode that PNG.", L"SIMP", MB_OK | MB_ICONERROR);
+        MessageBoxW(owner, L"Could not decode that image.", L"SIMP", MB_OK | MB_ICONERROR);
         return false;
     }
 
     g_state.image = std::move(decoded);
     g_state.hasImage = true;
-    g_state.imagePath = pngPath.wstring();
-    g_state.imageName = filenameOnly(pngPath);
+    g_state.imagePath = imagePath.wstring();
+    g_state.imageName = filenameOnly(imagePath);
 
-    const PngPhysicalInfo physical = parsePngPhysicalInfo(pngPath);
+    const PngPhysicalInfo physical = parsePngPhysicalInfo(imagePath);
     if (physical.found)
     {
         g_state.detectedPpi = (physical.ppiX + physical.ppiY) * 0.5;
@@ -1583,7 +1593,7 @@ bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
         HDROP drop = reinterpret_cast<HDROP>(wParam);
         wchar_t path[MAX_PATH] = {};
         if (DragQueryFileW(drop, 0, path, static_cast<UINT>(std::size(path))))
-            loadCanvasCaliperPngPath(hwnd, path);
+            loadCanvasCaliperImagePath(hwnd, path);
         DragFinish(drop);
         result = 0;
         return true;

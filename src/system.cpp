@@ -10,6 +10,8 @@
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <mutex>
 #include <process.h>
 #include <string>
@@ -20,6 +22,8 @@
 #include <shellapi.h>
 #include <wincodec.h>
 #include <windowsx.h>
+
+#include "stb/stb_image.h"
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -537,71 +541,53 @@ bool decodePngResourceBGRAWithFactory(IWICImagingFactory* factory, int resourceI
     return SUCCEEDED(result);
 }
 
-bool decodePngFileBGRAWithFactory(IWICImagingFactory* factory, const std::filesystem::path& filename, DecodedImage& image)
+// User-opened image files go through stb_image rather than WIC: it's a single
+// lightweight header with no COM lifetime to manage, and it covers PNG, JPEG,
+// BMP, TGA, GIF, PSD (flattened), HDR, PIC, and PNM in one path. Splash-screen
+// frames stay on the WIC decoder above since those are PNG resources baked
+// into the binary at build time.
+bool decodeImageFileBGRAImpl(const std::filesystem::path& filename, DecodedImage& image)
 {
     image = {};
 
-    if (!factory || filename.empty())
+    if (filename.empty())
         return false;
 
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* converter = nullptr;
-
-    HRESULT result = factory->CreateDecoderFromFilename(
-        filename.wstring().c_str(),
-        nullptr,
-        GENERIC_READ,
-        WICDecodeMetadataCacheOnDemand,
-        &decoder);
-
-    if (SUCCEEDED(result))
-        result = decoder->GetFrame(0, &frame);
-    if (SUCCEEDED(result))
-        result = factory->CreateFormatConverter(&converter);
-    if (SUCCEEDED(result))
-    {
-        result = converter->Initialize(
-            frame,
-            GUID_WICPixelFormat32bppBGRA,
-            WICBitmapDitherTypeNone,
-            nullptr,
-            0.0,
-            WICBitmapPaletteTypeCustom);
-    }
-
-    if (FAILED(result))
-    {
-        safeRelease(converter);
-        safeRelease(frame);
-        safeRelease(decoder);
+    std::ifstream input(filename, std::ios::binary);
+    if (!input)
         return false;
-    }
 
-    UINT width = 0;
-    UINT height = 0;
-    converter->GetSize(&width, &height);
-    if (width == 0 || height == 0)
-    {
-        safeRelease(converter);
-        safeRelease(frame);
-        safeRelease(decoder);
+    const std::vector<std::uint8_t> fileBytes(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    if (fileBytes.empty() || fileBytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return false;
+
+    int width = 0;
+    int height = 0;
+    int channelsInFile = 0;
+    stbi_uc* decoded = stbi_load_from_memory(fileBytes.data(), static_cast<int>(fileBytes.size()), &width, &height, &channelsInFile, 4);
+    if (!decoded || width <= 0 || height <= 0)
+        return false;
+
+    image.width = static_cast<UINT>(width);
+    image.height = static_cast<UINT>(height);
+    image.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+
+    // stb_image always hands back RGBA for a 4-channel request; SIMP's Vulkan
+    // texture and every existing pixel consumer (probe, palette) expect BGRA.
+    const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    for (std::size_t pixel = 0; pixel < pixelCount; ++pixel)
+    {
+        const std::size_t index = pixel * 4;
+        image.pixels[index + 0] = decoded[index + 2];
+        image.pixels[index + 1] = decoded[index + 1];
+        image.pixels[index + 2] = decoded[index + 0];
+        image.pixels[index + 3] = decoded[index + 3];
     }
 
-    const UINT stride = width * 4;
-    const UINT bufferSize = stride * height;
-    image.width = width;
-    image.height = height;
-    image.pixels.resize(bufferSize);
-
-    result = converter->CopyPixels(nullptr, stride, bufferSize, image.pixels.data());
-
-    safeRelease(converter);
-    safeRelease(frame);
-    safeRelease(decoder);
-
-    return SUCCEEDED(result);
+    stbi_image_free(decoded);
+    return true;
 }
 
 std::size_t countSplashFrameResources()
@@ -866,9 +852,9 @@ bool decodePngResourceBGRA(int resourceID, DecodedImage& image)
     return decodePngResourceBGRAWithFactory(g_wicFactory, resourceID, image);
 }
 
-bool decodePngFileBGRA(const std::filesystem::path& filename, DecodedImage& image)
+bool decodeImageFileBGRA(const std::filesystem::path& filename, DecodedImage& image)
 {
-    return decodePngFileBGRAWithFactory(g_wicFactory, filename, image);
+    return decodeImageFileBGRAImpl(filename, image);
 }
 
 bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)

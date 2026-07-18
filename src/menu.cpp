@@ -118,7 +118,7 @@ LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam)
     switch (LOWORD(wParam))
     {
     case IDM_FILE_OPEN:
-        openCanvasCaliperPngDialog(hwnd);
+        openCanvasCaliperImageDialog(hwnd);
         return 0;
 
     case IDM_FILE_EXIT:

@@ -30,7 +30,7 @@ const ThemePalette& getThemePalette();
 COLORREF getThemeColorRef();
 void applyWindowTheme(HWND hwnd);
 bool decodePngResourceBGRA(int resourceID, DecodedImage& image);
-bool decodePngFileBGRA(const std::filesystem::path& filename, DecodedImage& image);
+bool decodeImageFileBGRA(const std::filesystem::path& filename, DecodedImage& image);
 bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds);
 
 #endif
