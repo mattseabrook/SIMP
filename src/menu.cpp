@@ -7,8 +7,19 @@
 
 #include "../resource.h"
 
+#include <uxtheme.h>
+
 namespace
 {
+HBRUSH g_dialogBrush = nullptr;
+
+HBRUSH dialogBrush()
+{
+    if (!g_dialogBrush)
+        g_dialogBrush = CreateSolidBrush(RGB(8, 10, 14));
+    return g_dialogBrush;
+}
+
 void centerDialogOverOwner(HWND dialog)
 {
     HWND owner = GetParent(dialog);
@@ -69,8 +80,19 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
         g_menuActive = true;
         SetDlgItemTextW(dialog, IDC_ABOUT_TEXT, aboutText.c_str());
         applyWindowTheme(dialog);
+        SetWindowTheme(dialog, L"DarkMode_Explorer", nullptr);
+        SetWindowTheme(GetDlgItem(dialog, IDOK), L"DarkMode_Explorer", nullptr);
         centerDialogOverOwner(dialog);
         return TRUE;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, RGB(242, 244, 247));
+        SetBkColor(dc, RGB(8, 10, 14));
+        return reinterpret_cast<INT_PTR>(dialogBrush());
     }
 
     case WM_COMMAND:

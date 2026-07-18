@@ -18,6 +18,7 @@
 
 #include <commdlg.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 #include <windowsx.h>
 
 namespace
@@ -372,6 +373,7 @@ HWND makeEdit(HWND parent, UINT id, int x, int y, int width, int height)
 {
     HWND hwnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     setChildFont(hwnd);
+    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
     return hwnd;
 }
 
@@ -379,6 +381,7 @@ HWND makeButton(HWND parent, UINT id, const wchar_t* text, int x, int y, int wid
 {
     HWND hwnd = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     setChildFont(hwnd);
+    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
     return hwnd;
 }
 
@@ -1107,6 +1110,12 @@ void updatePanelDrag(ToolPanel& panel)
     RECT clientRect{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
     moveFloatingToolPanel(panel, clientRect);
     requestCanvasRender();
+
+    // Present immediately instead of waiting for the next message-loop tick: the
+    // parent's Vulkan surface must redraw the region the panel just vacated before
+    // DWM composites the next frame, or the drag leaves trailing ghost rectangles
+    // behind the panel (an old-school "cascading window" artifact).
+    renderFrame();
 }
 
 void finishPanelDrag(ToolPanel& panel)

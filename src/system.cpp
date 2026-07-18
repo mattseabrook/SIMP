@@ -39,6 +39,7 @@ constexpr UINT kSplashTimerId = 1;
 constexpr UINT kSplashFrameIntervalMs = 1000 / 30;
 constexpr UINT kSplashFrameReadyMessage = WM_APP + 18;
 constexpr int kSplashHorizontalPadding = 72;
+constexpr int kSplashBottomPadding = 28;
 constexpr int kSplashTextBlockAnchorYPercent = 80;
 constexpr DWORD kDwmColorDefault = 0xFFFFFFFFu;
 const wchar_t* kSplashWindowClassName = L"SimpSplashWindowClass";
@@ -284,8 +285,6 @@ void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT h
     const int titleBaseline = (static_cast<int>(height) * kSplashTextBlockAnchorYPercent) / 100;
     const int capitalY = titleBaseline - layout.boldMetrics.tmAscent;
     const int remainderY = titleBaseline - layout.regularMetrics.tmAscent;
-    const int titleBottom = std::max(capitalY + layout.boldMetrics.tmHeight, remainderY + layout.regularMetrics.tmHeight);
-    const int subtitleY = titleBottom + 12;
     const COLORREF titleColor = RGB(248, 248, 248);
     const COLORREF subtitleColor = RGB(236, 236, 236);
     COLORREF linkColor = GetSysColor(COLOR_HOTLIGHT);
@@ -308,18 +307,23 @@ void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT h
             x += layout.spaceWidth + gapBonus + (static_cast<int>(index) < gapRemainder ? 1 : 0);
     }
 
-    const std::wstring subtitlePrefix = std::wstring(L"Version ") + APP_VERSION_WSTRING + L"    Authored by: ";
-    const int prefixWidth = measureTextExtent(deviceContext, state.subtitleFont, subtitlePrefix).cx;
+    const std::wstring versionText = std::wstring(L"Version ") + APP_VERSION_WSTRING;
+    const std::wstring authoredPrefix = L"Authored by: ";
+    const int authoredPrefixWidth = measureTextExtent(deviceContext, state.subtitleFont, authoredPrefix).cx;
     const int authorWidth = measureTextExtent(deviceContext, state.linkFont, kSplashAuthorName).cx;
-    const int subtitleX = kSplashHorizontalPadding;
+    const int authoredTotalWidth = authoredPrefixWidth + authorWidth;
+    const int bottomLineHeight = std::max(layout.subtitleMetrics.tmHeight, layout.linkMetrics.tmHeight);
+    const int bottomY = static_cast<int>(height) - kSplashBottomPadding - bottomLineHeight;
+    const int authoredX = static_cast<int>(width) - kSplashHorizontalPadding - authoredTotalWidth;
 
-    drawTextRun(deviceContext, state.subtitleFont, subtitleX, subtitleY, subtitlePrefix, subtitleColor, shadowColor, 1);
-    drawTextRun(deviceContext, state.linkFont, subtitleX + prefixWidth, subtitleY, kSplashAuthorName, linkColor, shadowColor, 1);
+    drawTextRun(deviceContext, state.subtitleFont, kSplashHorizontalPadding, bottomY, versionText, subtitleColor, shadowColor, 1);
+    drawTextRun(deviceContext, state.subtitleFont, authoredX, bottomY, authoredPrefix, subtitleColor, shadowColor, 1);
+    drawTextRun(deviceContext, state.linkFont, authoredX + authoredPrefixWidth, bottomY, kSplashAuthorName, linkColor, shadowColor, 1);
 
-    state.hyperlinkRect.left = subtitleX + prefixWidth - 2;
-    state.hyperlinkRect.top = subtitleY - 2;
-    state.hyperlinkRect.right = subtitleX + prefixWidth + authorWidth + 2;
-    state.hyperlinkRect.bottom = subtitleY + std::max(layout.subtitleMetrics.tmHeight, layout.linkMetrics.tmHeight) + 2;
+    state.hyperlinkRect.left = authoredX + authoredPrefixWidth - 2;
+    state.hyperlinkRect.top = bottomY - 2;
+    state.hyperlinkRect.right = authoredX + authoredTotalWidth + 2;
+    state.hyperlinkRect.bottom = bottomY + bottomLineHeight + 2;
 
     SetBkMode(deviceContext, previousBkMode);
 }
@@ -848,6 +852,10 @@ void applyWindowTheme(HWND hwnd)
     if (!hwnd)
         return;
 
+    // SIMP's chrome is always dark (Photoshop/DeluxePaint-style), independent of the
+    // OS theme, so every top-level window and dialog gets the immersive dark frame.
+    const BOOL useDarkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
     DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
     DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
     RedrawWindow(hwnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);

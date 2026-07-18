@@ -421,3 +421,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local runtime state (window position, panel docking, canvas view) — regenerated on first run
+config.json
