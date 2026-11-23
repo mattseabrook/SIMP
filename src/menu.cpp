@@ -7,19 +7,10 @@
 
 #include "../resource.h"
 
-#include <uxtheme.h>
+#include "native_theme.h"
 
 namespace
 {
-HBRUSH g_dialogBrush = nullptr;
-
-HBRUSH dialogBrush()
-{
-    if (!g_dialogBrush)
-        g_dialogBrush = CreateSolidBrush(RGB(8, 10, 14));
-    return g_dialogBrush;
-}
-
 void centerDialogOverOwner(HWND dialog)
 {
     HWND owner = GetParent(dialog);
@@ -27,10 +18,7 @@ void centerDialogOverOwner(HWND dialog)
     GetWindowRect(dialog, &dialogRect);
 
     RECT targetRect{};
-    if (owner && GetWindowRect(owner, &targetRect))
-    {
-    }
-    else
+    if (!owner || !GetWindowRect(owner, &targetRect))
     {
         targetRect.left = 0;
         targetRect.top = 0;
@@ -45,30 +33,44 @@ void centerDialogOverOwner(HWND dialog)
 
     SetWindowPos(dialog, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
-}
+} // namespace
 
 void initMenu(HWND hwnd)
 {
     HMENU menuBar = CreateMenu();
     HMENU fileMenu = CreatePopupMenu();
+    HMENU optionsMenu = CreatePopupMenu();
     HMENU viewMenu = CreatePopupMenu();
     HMENU helpMenu = CreatePopupMenu();
 
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN, L"Open Image...");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_NEW, L"&New\tCtrl+N");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN, L"&Open...\tCtrl+O");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_SAVE, L"&Save\tCtrl+S");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_SAVE_DOCUMENT_AS, L"Save &As...\tCtrl+Shift+S");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_OPEN_DOCUMENT, L"Open SIMP Document...");
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_SAVE_DOCUMENT_AS, L"Save SIMP Document As...");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXPORT_PNG, L"Export to &PNG...");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, L"Exit");
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, L"E&xit");
+    HMENU editMenu = CreatePopupMenu();
+    AppendMenuW(editMenu, MF_STRING, IDM_EDIT_UNDO, L"&Undo\tCtrl+Z");
+    AppendMenuW(editMenu, MF_STRING, IDM_EDIT_REDO, L"&Redo\tCtrl+Y");
     AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_GRID, L"Grid");
     AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_RULERS, L"Rulers");
+    AppendMenuW(viewMenu, MF_STRING, IDM_VIEW_LINES, L"Lines");
+    AppendMenuW(optionsMenu, MF_STRING, IDM_OPTIONS_GRID, L"Grid...");
+    AppendMenuW(optionsMenu, MF_STRING, IDM_OPTIONS_RULERS, L"Rulers...");
+    AppendMenuW(optionsMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(optionsMenu, MF_STRING, IDM_OPTIONS_IMAGE, L"Image Settings...");
     AppendMenuW(helpMenu, MF_STRING, IDM_HELP_ABOUT, L"About SIMP");
 
-    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"File");
-    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(viewMenu), L"View");
-    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(helpMenu), L"Help");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"&File");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(editMenu), L"&Edit");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(optionsMenu), L"&Options");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(viewMenu), L"&View");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(helpMenu), L"&Help");
     updateCanvasCaliperMenu(menuBar);
 
+    themeNativeMenu(menuBar);
     SetMenu(hwnd, menuBar);
     DrawMenuBar(hwnd);
 }
@@ -77,38 +79,23 @@ INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARA
 {
     switch (message)
     {
-    case WM_INITDIALOG:
-    {
+    case WM_INITDIALOG: {
         const std::wstring aboutText = L"SIMP\nSimple Image Manipulation Program\nVersion " APP_VERSION_WSTRING;
-        g_menuActive = true;
         SetDlgItemTextW(dialog, IDC_ABOUT_TEXT, aboutText.c_str());
         applyWindowTheme(dialog);
-        SetWindowTheme(dialog, L"DarkMode_Explorer", nullptr);
-        SetWindowTheme(GetDlgItem(dialog, IDOK), L"DarkMode_Explorer", nullptr);
         centerDialogOverOwner(dialog);
         return TRUE;
-    }
-
-    case WM_CTLCOLORDLG:
-    case WM_CTLCOLORSTATIC:
-    {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, RGB(242, 244, 247));
-        SetBkColor(dc, RGB(8, 10, 14));
-        return reinterpret_cast<INT_PTR>(dialogBrush());
     }
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
-            g_menuActive = false;
             EndDialog(dialog, 0);
             return TRUE;
         }
         break;
 
     case WM_CLOSE:
-        g_menuActive = false;
         EndDialog(dialog, 0);
         return TRUE;
     }
@@ -120,11 +107,10 @@ LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam)
 {
     switch (LOWORD(wParam))
     {
-    case IDM_FILE_OPEN:
-        openCanvasCaliperImageDialog(hwnd);
+    case IDM_FILE_NEW:
+        showCanvasSettingsDialog(hwnd, IDM_FILE_NEW);
         return 0;
-
-    case IDM_FILE_OPEN_DOCUMENT:
+    case IDM_FILE_OPEN:
         openCanvasCaliperDocumentDialog(hwnd);
         return 0;
 
@@ -132,18 +118,32 @@ LRESULT handleMenuCommand(HWND hwnd, WPARAM wParam)
         saveCanvasCaliperDocumentAsDialog(hwnd);
         return 0;
 
+    case IDM_FILE_SAVE:
+        saveCanvasCaliperDocument(hwnd);
+        return 0;
+    case IDM_FILE_EXPORT_PNG:
+        exportCanvasCaliperPngDialog(hwnd);
+        return 0;
+    case IDM_EDIT_UNDO:
+        editCanvasCaliperHistory(hwnd, false);
+        return 0;
+    case IDM_EDIT_REDO:
+        editCanvasCaliperHistory(hwnd, true);
+        return 0;
     case IDM_FILE_EXIT:
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return 0;
 
-    case IDM_VIEW_GRID:
-        setCanvasCaliperGridVisible(!canvasCaliperGridVisible());
-        DrawMenuBar(hwnd);
+    case IDM_OPTIONS_GRID:
+    case IDM_OPTIONS_RULERS:
+    case IDM_OPTIONS_IMAGE:
+        showCanvasSettingsDialog(hwnd, LOWORD(wParam));
         return 0;
 
+    case IDM_VIEW_GRID:
     case IDM_VIEW_RULERS:
-        setCanvasCaliperRulersVisible(!canvasCaliperRulersVisible());
-        DrawMenuBar(hwnd);
+    case IDM_VIEW_LINES:
+        toggleCanvasView(hwnd, LOWORD(wParam));
         return 0;
 
     case IDM_HELP_ABOUT:

@@ -1,0 +1,9 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform writeonly image2D canvas;
+layout(push_constant) uniform Paint { ivec4 rect; vec4 color; } paint;
+void main() {
+    ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(local, paint.rect.zw))) return;
+    imageStore(canvas, paint.rect.xy + local, paint.color);
+}

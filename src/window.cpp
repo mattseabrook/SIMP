@@ -5,13 +5,13 @@
 #include "menu.h"
 #include "system.h"
 #include "vulkan.h"
+#include "native_theme.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
 HWND g_hwnd = nullptr;
-bool g_menuActive = false;
 
 namespace
 {
@@ -22,13 +22,14 @@ constexpr UINT kInteractiveRenderIntervalMs = 16;
 
 std::vector<DisplayInfo> g_displays;
 bool g_rendererInitialized = false;
+bool g_closing = false;
 bool g_needsRender = true;
-bool g_userIsResizing = false;
 int g_minClientWidth = MIN_CLIENT_WIDTH;
 int g_minClientHeight = MIN_CLIENT_HEIGHT;
 DWORD g_windowedStyle = WS_OVERLAPPEDWINDOW;
 WINDOWPLACEMENT g_windowedPlacement{sizeof(WINDOWPLACEMENT)};
 int g_initialShowCommand = SW_SHOWNORMAL;
+HMENU g_detachedMenu = nullptr;
 
 void refreshDisplayInfo()
 {
@@ -120,19 +121,16 @@ RECT clampWindowRectToWorkArea(const RECT& rect, const RECT& workArea)
     return clamped;
 }
 
-RECT buildInitialWindowRect()
+RECT buildWindowedRect()
 {
-    const bool fullscreen = config.value("fullscreen", false);
     const RECT monitorBounds = getPreferredMonitorBounds();
-    if (fullscreen)
-        return monitorBounds;
 
     RECT rect{};
     rect.left = 0;
     rect.top = 0;
     rect.right = std::max(MIN_CLIENT_WIDTH, config.value("width", DEFAULT_CLIENT_WIDTH));
     rect.bottom = std::max(MIN_CLIENT_HEIGHT, config.value("height", DEFAULT_CLIENT_HEIGHT));
-    AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, TRUE, 0);
+    AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, TRUE, 0, static_cast<UINT>(config.value("dpi", 96)));
 
     OffsetRect(
         &rect,
@@ -196,6 +194,7 @@ void setMinimumClientSize(int minClientWidth, int minClientHeight)
 
 void requestRender()
 {
+    if (g_needsRender) return;
     g_needsRender = true;
     if (g_hwnd)
         PostMessageW(g_hwnd, kWakeRenderMessage, 0, 0);
@@ -203,7 +202,7 @@ void requestRender()
 
 bool shouldRender()
 {
-    return g_needsRender;
+    return g_needsRender && g_rendererInitialized && g_hwnd && !IsIconic(g_hwnd);
 }
 
 void renderFrame()
@@ -211,8 +210,9 @@ void renderFrame()
     if (!g_rendererInitialized || !g_hwnd || IsIconic(g_hwnd))
         return;
 
-    renderFrameVk();
     g_needsRender = false;
+    flushCanvasCaliperEdits();
+    renderFrameVk();
 }
 
 void updateConfigFromWindow()
@@ -227,30 +227,50 @@ void updateConfigFromWindow()
         return;
 
     config["renderer"] = "VULKAN";
-    config["maximized"] = placement.showCmd == SW_SHOWMAXIMIZED;
-
-    RECT referenceRect = placement.rcNormalPosition;
-    HMONITOR monitor = MonitorFromRect(&referenceRect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFOEXW monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (GetMonitorInfoW(monitor, &monitorInfo))
+    if (!config.value("fullscreen", false))
     {
-        config["x"] = referenceRect.left - monitorInfo.rcMonitor.left;
-        config["y"] = referenceRect.top - monitorInfo.rcMonitor.top;
-
-        if (const DisplayInfo* display = findDisplayByBounds(monitorInfo.rcMonitor))
-            config["display"] = display->number;
-    }
-
-    if (!config.value("fullscreen", false) && placement.showCmd != SW_SHOWMAXIMIZED)
-    {
-        RECT clientRect{};
-        if (GetClientRect(g_hwnd, &clientRect))
+        const bool useNormalPlacement = placement.showCmd != SW_SHOWNORMAL;
+        config["maximized"] = placement.showCmd == SW_SHOWMAXIMIZED ||
+            (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED) != 0);
+        RECT referenceRect = placement.rcNormalPosition;
+        if (!useNormalPlacement)
+            GetWindowRect(g_hwnd, &referenceRect);
+        HMONITOR monitor = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (GetMonitorInfoW(monitor, &monitorInfo))
         {
-            const int clientWidth = static_cast<int>(clientRect.right - clientRect.left);
-            const int clientHeight = static_cast<int>(clientRect.bottom - clientRect.top);
-            config["width"] = std::max(g_minClientWidth, clientWidth);
-            config["height"] = std::max(g_minClientHeight, clientHeight);
+            if (useNormalPlacement)
+                OffsetRect(&referenceRect,
+                    monitorInfo.rcWork.left - monitorInfo.rcMonitor.left,
+                    monitorInfo.rcWork.top - monitorInfo.rcMonitor.top);
+            config["x"] = referenceRect.left - monitorInfo.rcMonitor.left;
+            config["y"] = referenceRect.top - monitorInfo.rcMonitor.top;
+
+            if (const DisplayInfo* display = findDisplayByBounds(monitorInfo.rcMonitor))
+                config["display"] = display->number;
+        }
+        config["dpi"] = static_cast<int>(GetDpiForWindow(g_hwnd));
+
+        if (useNormalPlacement)
+        {
+            RECT frame{0, 0, 0, 0};
+            const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(g_hwnd, GWL_STYLE));
+            const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE));
+            if (AdjustWindowRectExForDpi(&frame, style, GetMenu(g_hwnd) != nullptr, exStyle, GetDpiForWindow(g_hwnd)))
+            {
+                config["width"] = std::max(g_minClientWidth, static_cast<int>(referenceRect.right - referenceRect.left - (frame.right - frame.left)));
+                config["height"] = std::max(g_minClientHeight, static_cast<int>(referenceRect.bottom - referenceRect.top - (frame.bottom - frame.top)));
+            }
+        }
+        else
+        {
+            RECT clientRect{};
+            if (GetClientRect(g_hwnd, &clientRect))
+            {
+                config["width"] = std::max(g_minClientWidth, static_cast<int>(clientRect.right - clientRect.left));
+                config["height"] = std::max(g_minClientHeight, static_cast<int>(clientRect.bottom - clientRect.top));
+            }
         }
     }
 
@@ -263,6 +283,8 @@ void toggleFullscreen()
         return;
 
     const bool enteringFullscreen = !config.value("fullscreen", false);
+    if (enteringFullscreen)
+        updateConfigFromWindow();
     config["fullscreen"] = enteringFullscreen;
 
     if (enteringFullscreen)
@@ -271,6 +293,7 @@ void toggleFullscreen()
         g_windowedPlacement.length = sizeof(WINDOWPLACEMENT);
         GetWindowPlacement(g_hwnd, &g_windowedPlacement);
 
+        g_detachedMenu = GetMenu(g_hwnd);
         SetMenu(g_hwnd, nullptr);
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
 
@@ -293,9 +316,11 @@ void toggleFullscreen()
     else
     {
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, g_windowedStyle);
+        if (g_detachedMenu) SetMenu(g_hwnd, g_detachedMenu);
+        else initMenu(g_hwnd);
+        g_detachedMenu = nullptr;
         SetWindowPlacement(g_hwnd, &g_windowedPlacement);
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-        initMenu(g_hwnd);
         updateCanvasCaliperMenu(GetMenu(g_hwnd));
         DrawMenuBar(g_hwnd);
     }
@@ -305,17 +330,31 @@ void toggleFullscreen()
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    LRESULT themed = 0;
+    if (handleNativeThemeMessage(hwnd, message, wParam, lParam, themed)) return themed;
     switch (message)
     {
+    case WM_INITMENUPOPUP:
+        updateCanvasCaliperMenu(GetMenu(hwnd));
+        return 0;
+
     case WM_COMMAND:
-        if (handleCanvasCaliperCommand(hwnd, wParam, lParam))
-            return 0;
         return handleMenuCommand(hwnd, wParam);
+
+    case WM_SIMP_RENDER_READY:
+        requestRender();return 0;
 
     case kWakeRenderMessage:
         return 0;
 
     case WM_CLOSE:
+        if (g_closing) return 0;
+        g_closing = true;
+        if (!confirmCanvasCaliperClose(hwnd))
+        {
+            g_closing = false;
+            return 0;
+        }
         try
         {
             save_config(getConfigPath());
@@ -323,10 +362,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         catch (...)
         {
         }
+        EnableWindow(hwnd,FALSE);
+        g_rendererInitialized=false;
+        shutdownCanvasCaliper();
+        cleanupVulkan();
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
+        g_rendererInitialized = false;
+        g_needsRender = false;
         KillTimer(hwnd, kInteractiveRenderTimerId);
         PostQuitMessage(0);
         return 0;
@@ -344,14 +389,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 1;
 
     case WM_ENTERSIZEMOVE:
-        g_userIsResizing = true;
         SetTimer(hwnd, kInteractiveRenderTimerId, kInteractiveRenderIntervalMs, nullptr);
         requestRender();
         return 0;
 
     case WM_EXITSIZEMOVE:
     {
-        g_userIsResizing = false;
         KillTimer(hwnd, kInteractiveRenderTimerId);
 
         RECT clientRect{};
@@ -366,6 +409,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (wParam == kInteractiveRenderTimerId)
         {
             requestRender();
+            if (shouldRender()) renderFrame();
             return 0;
         }
         break;
@@ -376,10 +420,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
         applyResize(LOWORD(lParam), HIWORD(lParam));
         layoutCanvasCaliperChrome();
-        return 0;
-
-    case WM_MOVE:
-        requestRender();
         return 0;
 
     case WM_GETMINMAXINFO:
@@ -400,7 +440,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_SYSCOLORCHANGE:
         refreshThemePalette();
         applyWindowTheme(hwnd);
-        invalidateCanvasCaliperToolbar();
         requestRender();
         return 0;
 
@@ -422,6 +461,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 suggestedRect->bottom - suggestedRect->top,
                 SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        layoutCanvasCaliperChrome();
         requestRender();
         return 0;
 
@@ -447,7 +487,7 @@ void initWindow(HINSTANCE instance, bool showWindowNow)
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
-    windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS;
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -458,9 +498,25 @@ void initWindow(HINSTANCE instance, bool showWindowNow)
     if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         throw std::runtime_error("Failed to register the SIMP window class.");
 
-    const RECT windowRect = buildInitialWindowRect();
     const bool fullscreen = config.value("fullscreen", false);
+    const RECT windowedRect = buildWindowedRect();
+    const RECT windowRect = fullscreen ? getPreferredMonitorBounds() : windowedRect;
     const DWORD style = fullscreen ? (WS_POPUP | WS_VISIBLE) : WS_OVERLAPPEDWINDOW;
+
+    if (fullscreen)
+    {
+        g_windowedStyle = WS_OVERLAPPEDWINDOW;
+        g_windowedPlacement = WINDOWPLACEMENT{sizeof(WINDOWPLACEMENT)};
+        g_windowedPlacement.showCmd = config.value("maximized", false) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        g_windowedPlacement.rcNormalPosition = windowedRect;
+        HMONITOR monitor = MonitorFromRect(&windowedRect, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(monitor, &info))
+            OffsetRect(&g_windowedPlacement.rcNormalPosition,
+                info.rcMonitor.left - info.rcWork.left,
+                info.rcMonitor.top - info.rcWork.top);
+    }
 
     const std::wstring title(windowTitle.begin(), windowTitle.end());
     g_hwnd = CreateWindowExW(
@@ -509,7 +565,10 @@ void showMainWindow()
 
 bool processEvents()
 {
+    checkVulkanError();
+    serviceCanvasBackgroundWork();
     MSG message{};
+    const ULONGLONG started = GetTickCount64();
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
     {
         if (message.message == WM_QUIT)
@@ -517,19 +576,21 @@ bool processEvents()
 
         TranslateMessage(&message);
         DispatchMessageW(&message);
+        if (GetTickCount64() - started >= 8) break;
     }
 
+    checkVulkanError();
+    serviceCanvasBackgroundWork();
     return true;
 }
 
 void cleanupWindow()
 {
-    if (g_rendererInitialized)
-    {
-        shutdownCanvasCaliper();
-        cleanupVulkan();
-        g_rendererInitialized = false;
-    }
-
+    shutdownCanvasCaliper();
+    cleanupVulkan();
+    g_rendererInitialized = false;
+    if (g_detachedMenu) DestroyMenu(g_detachedMenu);
+    g_detachedMenu = nullptr;
+    if (g_hwnd && IsWindow(g_hwnd)) DestroyWindow(g_hwnd);
     g_hwnd = nullptr;
 }

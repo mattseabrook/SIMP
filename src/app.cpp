@@ -10,69 +10,34 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <string>
-#include <unordered_map>
+#include <utility>
 
 #include <commdlg.h>
 #include <shellapi.h>
-#include <uxtheme.h>
+#include "../resource.h"
+#include "editor_ui.h"
+#include "editor_format.h"
+#include "image_history.h"
+#include "paint_tools.h"
+#include "cpu_work.h"
+#include "cpu_pixels.h"
+#include <deque>
+#include <mutex>
+#include <functional>
+#include <thread>
+#include <atomic>
 #include <windowsx.h>
 
 namespace
 {
-constexpr int kHeaderHeight = 32;
-constexpr int kSnapDistance = 28;
-constexpr int kLeftPanelWidth = 244;
-constexpr int kRightPanelWidth = 360;
-constexpr int kFloatingLeftHeight = 690;
-constexpr int kFloatingRightHeight = 650;
-constexpr int kRulerThickness = 28;
-constexpr double kMaxZoom = 32.0;
+constexpr double kMaxZoom = 128.0;
 constexpr double kZoomStep = 1.25;
-constexpr int kTopToolbarHeight = 34;
-constexpr int kTopToolbarIconSlot = 34;
-
-enum ControlId : UINT
-{
-    IDC_CC_IMAGE_WIDTH = 51001,
-    IDC_CC_IMAGE_HEIGHT,
-    IDC_CC_IMAGE_PPI,
-    IDC_CC_CANVAS_WIDTH,
-    IDC_CC_CANVAS_HEIGHT,
-    IDC_CC_GRID_SIZE,
-    IDC_CC_MAJOR_EVERY,
-    IDC_CC_OFFSET_X,
-    IDC_CC_OFFSET_Y,
-    IDC_CC_ZOOM,
-    IDC_CC_PALETTE_COUNT,
-    IDC_CC_OPEN,
-    IDC_CC_USE_PNG,
-    IDC_CC_RESET_OFFSET,
-    IDC_CC_FIT_VIEW,
-    IDC_CC_ZOOM_OUT,
-    IDC_CC_ZOOM_IN,
-    IDC_CC_CLEAR,
-    IDC_CC_SAVE
-};
-
-enum class ToolbarKind
-{
-    Left,
-    Right
-};
-
-enum class ToolbarDock
-{
-    Floating,
-    Left,
-    Right
-};
-
 struct PngPhysicalInfo
 {
     bool found = false;
@@ -80,817 +45,704 @@ struct PngPhysicalInfo
     double ppiY = 0.0;
 };
 
-struct PaletteColor
-{
-    std::uint8_t red = 0;
-    std::uint8_t green = 0;
-    std::uint8_t blue = 0;
-    std::uint32_t count = 0;
-};
-
-struct CanvasState
-{
-    double imageWidthIn = 30.0;
-    double imageHeightIn = 40.0;
-    double imagePpi = 100.0;
-    double canvasWidthIn = 29.75;
-    double canvasHeightIn = 39.5;
-    double gridSizeIn = 2.0;
-    double offsetXIn = 0.0;
-    double offsetYIn = 0.0;
-    double zoomScale = 1.0;
-    int majorEvery = 0;
-    int paletteCount = 32;
-    bool showGrid = true;
-    bool showRulers = true;
-    bool hasImage = false;
-    std::wstring imagePath;
-    std::wstring imageName;
-    double detectedPpi = 100.0;
-    std::wstring ppiSource = L"manual";
-    DecodedImage image;
-    std::vector<PaletteColor> palette;
-    bool probeValid = false;
-    PaletteColor probeColor;
-    std::wstring probeText = L"Move over image";
-    std::wstring cursorSummary = L"-";
-};
-
-struct CanvasLayout
-{
-    double originX = 0.0;
-    double originY = 0.0;
-    double fitPxPerIn = 1.0;
-    double pxPerIn = 1.0;
-    double contentMinXIn = 0.0;
-    double contentMinYIn = 0.0;
-    double contentMaxXIn = 1.0;
-    double contentMaxYIn = 1.0;
-    int leftInset = 0;
-    int rightInset = 0;
-    int topInset = kTopToolbarHeight;
-};
-
-struct ToolPanel
-{
-    ToolbarKind kind = ToolbarKind::Left;
-    ToolbarDock dock = ToolbarDock::Floating;
-    HWND hwnd = nullptr;
-    SIZE preferredSize{};
-    RECT floatingRect{};
-    bool dragging = false;
-    POINT dragStartScreen{};
-    RECT dragStartRect{};
-};
-
-struct LeftControls
-{
-    HWND status = nullptr;
-    HWND pixels = nullptr;
-    HWND ppi = nullptr;
-    HWND sourceSize = nullptr;
-    HWND imageSummary = nullptr;
-    HWND canvasSummary = nullptr;
-    HWND gridSummary = nullptr;
-    HWND cursorSummary = nullptr;
-    HWND displaySummary = nullptr;
-    HWND imageWidth = nullptr;
-    HWND imageHeight = nullptr;
-    HWND imagePpi = nullptr;
-    HWND canvasWidth = nullptr;
-    HWND canvasHeight = nullptr;
-    HWND gridSize = nullptr;
-    HWND majorEvery = nullptr;
-    HWND offsetX = nullptr;
-    HWND offsetY = nullptr;
-    HWND zoom = nullptr;
-    HWND paletteCount = nullptr;
-};
-
 struct DragState
 {
     bool panning = false;
+    bool painting = false;
+    bool havePosition = false;
+    int lastX = -1;
+    int lastY = -1;
     POINT startPoint{};
     double startOffsetXIn = 0.0;
     double startOffsetYIn = 0.0;
 };
 
 CanvasState g_state;
+ImageHistory g_history;
+bool g_documentModified = false;
+std::wstring g_lastTitle;
+std::filesystem::path g_documentPath;
+int g_dragLine = -1;
+void showLineDialog(HWND owner, int index);
 CanvasLayout g_layout;
-ToolPanel g_leftPanel{ToolbarKind::Left, ToolbarDock::Left, nullptr, {kLeftPanelWidth, kFloatingLeftHeight}, {0, kTopToolbarHeight, kLeftPanelWidth, kTopToolbarHeight + kFloatingLeftHeight}};
-ToolPanel g_rightPanel{ToolbarKind::Right, ToolbarDock::Right, nullptr, {kRightPanelWidth, kFloatingRightHeight}, {0, kTopToolbarHeight, kRightPanelWidth, kTopToolbarHeight + kFloatingRightHeight}};
-LeftControls g_controls;
 DragState g_drag;
+RECT g_dirtyPixels{};
+bool g_hasDirtyPixels = false;
 HWND g_parent = nullptr;
-HFONT g_uiFont = nullptr;
-HBRUSH g_panelBrush = nullptr;
-HBRUSH g_editBrush = nullptr;
-bool g_syncingControls = false;
-bool g_registeredPanelClass = false;
+int g_rulerUnits = 0; // pixels, inches, centimeters
+int g_brushWheelDelta = 0;
+double g_panX = 0.0, g_panY = 0.0;
+double g_uiScale = 1.0;
+int g_surfaceWidth = 0, g_surfaceHeight = 0;
+std::vector<UiHit> g_uiHits;
+constexpr UINT kCpuReadyMessage = WM_APP + 40;
+std::mutex g_completionMutex;
+std::deque<std::function<void()>> g_completions;
+std::vector<std::pair<std::uint64_t, std::wstring>> g_activity;
+std::uint64_t g_jobId = 0, g_epoch = 0, g_revision = 0, g_pixelsRevision = 0, g_openTicket = 0;
+bool g_paletteRunning = false, g_paletteDirty = false, g_saving = false, g_saveAgain = false, g_shutdown = false,
+     g_confirming = false;
+bool g_trackingMouse = false, g_dragPalette = false, g_dragCels = false;
+std::uint64_t g_nextCelId = 2;
+void renameActiveCel(HWND);
+void handleCelAction(HWND, int);
+int g_lineOptions = -1;
+std::shared_ptr<std::atomic<bool>> g_openCancel;
+std::filesystem::path g_savingPath, g_queuedSavePath;
+std::uint64_t g_savingEpoch = 0, g_queuedSaveEpoch = 0;
+void createCanvasAsync(std::uint32_t width, std::uint32_t height, double ppi);
 
-const wchar_t* kPanelClassName = L"SimpCanvasCaliperToolPanel";
+void requestCanvasRender();
+void schedulePalette();
+void finishActivity(std::uint64_t id)
+{
+    std::erase_if(g_activity, [id](const auto &item) { return item.first == id; });
+    g_state.activity = g_activity.empty() ? L"" : g_activity.back().second;
+}
+template <class Work, class Done>
+void startCpuJob(const wchar_t *label, Work work, Done done, std::function<void()> failed = {})
+{
+    const auto id = ++g_jobId;
+    const HWND owner = g_parent;
+    g_activity.emplace_back(id, label);
+    g_state.activity = label;
+    requestRender();
+    enqueueCpuWork([id, owner, work = std::move(work), done = std::move(done), failed = std::move(failed)]() mutable {
+        std::function<void()> completion;
+        try
+        {
+            auto result = std::make_shared<decltype(work())>(work());
+            completion = [id, result, done = std::move(done)]() mutable {
+                finishActivity(id);
+                done(std::move(*result));
+                requestRender();
+            };
+        }
+        catch (...)
+        {
+            const auto error = std::current_exception();
+            completion = [id, error, owner, failed = std::move(failed)] {
+                finishActivity(id);
+                if (failed)
+                    failed();
+                try
+                {
+                    std::rethrow_exception(error);
+                }
+                catch (const std::exception &e)
+                {
+                    MessageBoxA(owner, e.what(), "SIMP", MB_OK | MB_ICONERROR);
+                }
+                catch (...)
+                {
+                    MessageBoxW(owner, L"The background operation failed.", L"SIMP", MB_OK | MB_ICONERROR);
+                }
+                requestRender();
+            };
+        }
+        {
+            std::lock_guard lock(g_completionMutex);
+            g_completions.push_back(std::move(completion));
+        }
+        PostMessageW(owner, kCpuReadyMessage, 0, 0);
+    });
+}
+void markDocumentModified()
+{
+    g_documentModified = true;
+    ++g_revision;
+}
+
+void resetEditingSession()
+{
+    ++g_epoch;
+    ++g_revision;
+    ++g_pixelsRevision;
+    ++g_openTicket;
+    g_paletteDirty = false;
+    g_state.cels = {Cel{}};
+    g_state.activeCel = 0;
+    g_state.celOffset = 0;
+    g_state.celBusy = false;
+    g_nextCelId = 2;
+    g_state.paletteOffset = 0;
+    if (g_openCancel)
+        g_openCancel->store(true);
+    g_history.clear();
+    g_drag = {};
+    g_dragLine = -1;
+    g_dragPalette = false;
+    g_dragCels = false;
+    g_state.highlightedLine = -1;
+    if (GetCapture() == g_parent)
+        ReleaseCapture();
+    g_documentPath.clear();
+    g_state.lines.clear();
+    g_state.probeValid = false;
+    g_documentModified = false;
+}
+
+std::filesystem::path lastOpenFile()
+{
+    if (!config.contains("lastOpenFile") || !config["lastOpenFile"].is_string())
+        return {};
+    const auto text = config["lastOpenFile"].get<std::string>();
+    if (text.size() > 131072 || text.find('\0') != std::string::npos)
+        return {};
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+void rememberOpenFile(const std::filesystem::path &path)
+{
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error).lexically_normal();
+    if (error)
+        return;
+    const auto utf8 = absolute.u8string();
+    config["lastOpenFile"] = std::string(reinterpret_cast<const char *>(utf8.data()), utf8.size());
+    try
+    {
+        save_config(getConfigPath());
+    }
+    catch (...)
+    {
+        MessageBoxW(g_parent, L"Could not remember the file for startup. Check access to config.json.", L"SIMP",
+                    MB_OK | MB_ICONWARNING);
+    }
+}
+void refreshDocumentTitle()
+{
+    const std::wstring title = (g_state.imageName.empty() ? L"Untitled" : g_state.imageName) +
+                               (g_documentModified ? L" * - SIMP" : L" - SIMP");
+    if (g_parent && title != g_lastTitle)
+    {
+        SetWindowTextW(g_parent, title.c_str());
+        g_lastTitle = title;
+    }
+}
 
 double clampDouble(double value, double minimum, double maximum)
 {
-    return std::min(maximum, std::max(minimum, value));
+    return std::isfinite(value) ? std::clamp(value, minimum, maximum) : minimum;
 }
 
-double snapQuarter(double value)
+PngPhysicalInfo parsePngPhysicalInfo(const std::filesystem::path &path)
 {
-    return std::round(value * 4.0) / 4.0;
-}
-
-std::wstring formatDouble(double value, int precision = 2)
-{
-    wchar_t buffer[64] = {};
-    std::swprintf(buffer, std::size(buffer), precision == 3 ? L"%.3f" : L"%.2f", value);
-    return buffer;
-}
-
-std::wstring formatInt(int value)
-{
-    wchar_t buffer[32] = {};
-    std::swprintf(buffer, std::size(buffer), L"%d", value);
-    return buffer;
-}
-
-std::wstring formatHex(const PaletteColor& color)
-{
-    wchar_t buffer[16] = {};
-    std::swprintf(buffer, std::size(buffer), L"#%02X%02X%02X", color.red, color.green, color.blue);
-    return buffer;
-}
-
-std::wstring filenameOnly(const std::filesystem::path& path)
-{
-    return path.filename().wstring();
-}
-
-bool isSupportedImagePath(const std::filesystem::path& path)
-{
-    constexpr std::array<const wchar_t*, 12> kSupportedExtensions = {
-        L".png", L".jpg", L".jpeg", L".bmp", L".tga", L".gif",
-        L".psd", L".hdr", L".pic", L".pnm", L".ppm", L".pgm"};
-
-    const std::wstring extension = path.extension().wstring();
-    return std::any_of(kSupportedExtensions.begin(), kSupportedExtensions.end(), [&](const wchar_t* candidate) {
-        return _wcsicmp(extension.c_str(), candidate) == 0;
-    });
-}
-
-std::uint32_t readBigEndian32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
-{
-    return (static_cast<std::uint32_t>(bytes[offset]) << 24) |
-        (static_cast<std::uint32_t>(bytes[offset + 1]) << 16) |
-        (static_cast<std::uint32_t>(bytes[offset + 2]) << 8) |
-        static_cast<std::uint32_t>(bytes[offset + 3]);
-}
-
-PngPhysicalInfo parsePngPhysicalInfo(const std::filesystem::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input)
         return {};
-
-    std::vector<std::uint8_t> bytes(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-
-    constexpr std::uint8_t signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
-    if (bytes.size() < sizeof(signature) || !std::equal(std::begin(signature), std::end(signature), bytes.begin()))
+    const auto end = input.tellg();
+    input.seekg(0);
+    std::array<std::uint8_t, 8> signature{};
+    input.read(reinterpret_cast<char *>(signature.data()), 8);
+    if (signature != std::array<std::uint8_t, 8>{137, 80, 78, 71, 13, 10, 26, 10})
         return {};
-
-    std::size_t offset = sizeof(signature);
-    while (offset + 12 <= bytes.size())
+    const auto be32 = [](const std::uint8_t *p) {
+        return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) | (std::uint32_t(p[2]) << 8) | p[3];
+    };
+    while (input && end - input.tellg() >= 12)
     {
-        const std::uint32_t length = readBigEndian32(bytes, offset);
-        if (offset + 12u + length > bytes.size())
+        std::array<std::uint8_t, 8> header{};
+        input.read(reinterpret_cast<char *>(header.data()), 8);
+        const auto size = be32(header.data());
+        if (std::uint64_t(size) + 4 > static_cast<std::uint64_t>(end - input.tellg()))
             break;
-
-        const char type0 = static_cast<char>(bytes[offset + 4]);
-        const char type1 = static_cast<char>(bytes[offset + 5]);
-        const char type2 = static_cast<char>(bytes[offset + 6]);
-        const char type3 = static_cast<char>(bytes[offset + 7]);
-        if (type0 == 'p' && type1 == 'H' && type2 == 'Y' && type3 == 's' && length >= 9)
+        if (!std::memcmp(header.data() + 4, "IDAT", 4) || !std::memcmp(header.data() + 4, "IEND", 4))
+            break;
+        if (!std::memcmp(header.data() + 4, "pHYs", 4) && size == 9)
         {
-            const std::size_t data = offset + 8;
-            const std::uint32_t ppmX = readBigEndian32(bytes, data);
-            const std::uint32_t ppmY = readBigEndian32(bytes, data + 4);
-            const std::uint8_t unit = bytes[data + 8];
-            if (unit == 1 && ppmX > 0 && ppmY > 0)
-                return {true, static_cast<double>(ppmX) * 0.0254, static_cast<double>(ppmY) * 0.0254};
+            std::uint8_t physical[9]{};
+            input.read(reinterpret_cast<char *>(physical), 9);
+            const auto x = be32(physical), y = be32(physical + 4);
+            if (physical[8] == 1 && x && y)
+                return {true, x * 0.0254, y * 0.0254};
+            break;
         }
-
-        offset += 12u + length;
+        input.seekg(std::streamoff(size) + 4, std::ios::cur);
     }
-
     return {};
 }
 
-double jsonDouble(const nlohmann::json& object, const char* key, double fallback)
+double jsonDouble(const nlohmann::json &object, const char *key, double fallback)
 {
     if (!object.contains(key) || !object[key].is_number())
         return fallback;
-    return object[key].get<double>();
+    const double value = object[key].get<double>();
+    return std::isfinite(value) ? value : fallback;
 }
 
-int jsonInt(const nlohmann::json& object, const char* key, int fallback)
+int jsonInt(const nlohmann::json &object, const char *key, int fallback)
 {
     if (!object.contains(key) || !object[key].is_number_integer())
         return fallback;
     return object[key].get<int>();
 }
 
-bool jsonBool(const nlohmann::json& object, const char* key, bool fallback)
+bool jsonBool(const nlohmann::json &object, const char *key, bool fallback)
 {
     if (!object.contains(key) || !object[key].is_boolean())
         return fallback;
     return object[key].get<bool>();
 }
 
-ToolbarDock dockFromString(const std::string& value, ToolbarDock fallback)
+int ui(int value)
 {
-    if (value == "left")
-        return ToolbarDock::Left;
-    if (value == "right")
-        return ToolbarDock::Right;
-    if (value == "floating")
-        return ToolbarDock::Floating;
-    return fallback;
+    return static_cast<int>(std::round(value * g_uiScale));
 }
-
-std::string dockToString(ToolbarDock dock)
-{
-    switch (dock)
-    {
-    case ToolbarDock::Left:
-        return "left";
-    case ToolbarDock::Right:
-        return "right";
-    case ToolbarDock::Floating:
-    default:
-        return "floating";
-    }
-}
-
-void setControlText(HWND hwnd, const std::wstring& text)
-{
-    if (hwnd)
-        SetWindowTextW(hwnd, text.c_str());
-}
-
-double readControlDouble(HWND hwnd, double fallback, double minimum, double maximum)
-{
-    wchar_t buffer[128] = {};
-    if (!hwnd || GetWindowTextW(hwnd, buffer, static_cast<int>(std::size(buffer))) <= 0)
-        return fallback;
-
-    wchar_t* end = nullptr;
-    const double value = std::wcstod(buffer, &end);
-    if (end == buffer || !std::isfinite(value))
-        return fallback;
-
-    return clampDouble(value, minimum, maximum);
-}
-
-int readControlInt(HWND hwnd, int fallback, int minimum, int maximum)
-{
-    wchar_t buffer[128] = {};
-    if (!hwnd || GetWindowTextW(hwnd, buffer, static_cast<int>(std::size(buffer))) <= 0)
-        return fallback;
-
-    wchar_t* end = nullptr;
-    const long value = std::wcstol(buffer, &end, 10);
-    if (end == buffer)
-        return fallback;
-
-    return static_cast<int>(std::clamp<long>(value, minimum, maximum));
-}
-
-void setChildFont(HWND hwnd)
-{
-    if (hwnd && g_uiFont)
-        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-}
-
-HWND makeStatic(HWND parent, const wchar_t* text, int x, int y, int width, int height, UINT id = 0)
-{
-    HWND hwnd = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
-    setChildFont(hwnd);
-    return hwnd;
-}
-
-HWND makeEdit(HWND parent, UINT id, int x, int y, int width, int height)
-{
-    HWND hwnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
-    setChildFont(hwnd);
-    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
-    return hwnd;
-}
-
-HWND makeButton(HWND parent, UINT id, const wchar_t* text, int x, int y, int width, int height)
-{
-    HWND hwnd = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
-    setChildFont(hwnd);
-    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
-    return hwnd;
-}
-
-void drawPanelText(HDC dc, const std::wstring& text, int x, int y, int width, int height, COLORREF color, UINT format = DT_LEFT | DT_TOP | DT_SINGLELINE)
-{
-    RECT rect{x, y, x + width, y + height};
-    SetTextColor(dc, color);
-    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &rect, format);
-}
-
-void syncControlsFromState();
-void updateStatusControls();
-void requestCanvasRender();
-void readControlsToState();
-void applyPngSpecsToState();
-void computePalette();
-bool handlePanelCommand(WPARAM wParam, LPARAM lParam);
-void snapToolPanel(ToolPanel& panel);
-void moveFloatingToolPanel(ToolPanel& panel, const RECT& rect);
-LRESULT CALLBACK ToolPanelProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-void ensureToolbarTexture(std::uint32_t width);
 
 CanvasLayout computeLayout(std::uint32_t width, std::uint32_t height)
 {
-    CanvasLayout layout;
-
-    if (g_leftPanel.hwnd && IsWindowVisible(g_leftPanel.hwnd) && g_leftPanel.dock == ToolbarDock::Left)
-        layout.leftInset = g_leftPanel.preferredSize.cx;
-    if (g_rightPanel.hwnd && IsWindowVisible(g_rightPanel.hwnd) && g_rightPanel.dock == ToolbarDock::Right)
-        layout.rightInset = g_rightPanel.preferredSize.cx;
-
-    const int ruler = g_state.showRulers ? kRulerThickness : 0;
-    const int topInset = layout.topInset;
-    layout.contentMinXIn = std::min(0.0, g_state.hasImage ? g_state.offsetXIn : 0.0);
-    layout.contentMinYIn = std::min(0.0, g_state.hasImage ? g_state.offsetYIn : 0.0);
-    layout.contentMaxXIn = std::max(g_state.canvasWidthIn, g_state.hasImage ? g_state.offsetXIn + g_state.imageWidthIn : g_state.canvasWidthIn);
-    layout.contentMaxYIn = std::max(g_state.canvasHeightIn, g_state.hasImage ? g_state.offsetYIn + g_state.imageHeightIn : g_state.canvasHeightIn);
-
-    const double contentWidthIn = std::max(0.01, layout.contentMaxXIn - layout.contentMinXIn);
-    const double contentHeightIn = std::max(0.01, layout.contentMaxYIn - layout.contentMinYIn);
-    const double availableWidth = std::max(80.0, static_cast<double>(width - std::min<std::uint32_t>(width, layout.leftInset + layout.rightInset + ruler)));
-    const double availableHeight = std::max(80.0, static_cast<double>(height - std::min<std::uint32_t>(height, static_cast<std::uint32_t>(topInset) + ruler)));
-
-    layout.fitPxPerIn = std::min(availableWidth / contentWidthIn, availableHeight / contentHeightIn);
-    layout.pxPerIn = std::max(1.0, layout.fitPxPerIn * g_state.zoomScale);
-    layout.originX = static_cast<double>(layout.leftInset + ruler) - layout.contentMinXIn * layout.pxPerIn;
-    layout.originY = static_cast<double>(topInset + ruler) - layout.contentMinYIn * layout.pxPerIn;
-    return layout;
+    return computeCanvasLayout(g_state, width, height, g_uiScale, g_panX, g_panY);
 }
 
-void addOverlayRect(CanvasRenderData& data, std::int32_t x, std::int32_t y, std::uint32_t width, std::uint32_t height, COLORREF color, std::uint32_t surfaceWidth, std::uint32_t surfaceHeight)
+CanvasViewport workspaceRect()
 {
-    if (width == 0 || height == 0 || surfaceWidth == 0 || surfaceHeight == 0)
+    const int ruler = g_state.showRulers ? ui(kRulerThickness) : 0;
+    return {g_layout.leftInset + ruler, g_layout.topInset + ruler, g_surfaceWidth - g_layout.rightInset,
+            g_surfaceHeight - ui(kStatusHeight)};
+}
+bool insideWorkspace(int x, int y)
+{
+    const auto r = workspaceRect();
+    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+void updateGuideHighlight(int x, int y)
+{
+    const int axis = rulerAxis(g_layout, g_surfaceWidth, g_surfaceHeight, g_uiScale, g_state.showRulers, x, y);
+    const int highlighted =
+        g_dragLine >= 0
+            ? g_dragLine
+            : (g_lineOptions >= 0 ? g_lineOptions : hitGuide(g_state, g_layout, axis, axis == 0 ? x : y, ui(12)));
+    if (highlighted != g_state.highlightedLine)
+    {
+        g_state.highlightedLine = highlighted;
+        requestRender();
+    }
+}
+void moveDraggedLine(int x, int y)
+{
+    if (g_dragLine < 0 || std::size_t(g_dragLine) >= g_state.lines.size())
         return;
-
-    std::int32_t left = x;
-    std::int32_t top = y;
-    std::int32_t right = x + static_cast<std::int32_t>(width);
-    std::int32_t bottom = y + static_cast<std::int32_t>(height);
-
-    left = std::max<std::int32_t>(0, left);
-    top = std::max<std::int32_t>(0, top);
-    right = std::min<std::int32_t>(static_cast<std::int32_t>(surfaceWidth), right);
-    bottom = std::min<std::int32_t>(static_cast<std::int32_t>(surfaceHeight), bottom);
-    if (right <= left || bottom <= top)
-        return;
-
-    CanvasOverlayRect rect;
-    rect.x = left;
-    rect.y = top;
-    rect.width = static_cast<std::uint32_t>(right - left);
-    rect.height = static_cast<std::uint32_t>(bottom - top);
-    rect.red = static_cast<float>(GetRValue(color)) / 255.0f;
-    rect.green = static_cast<float>(GetGValue(color)) / 255.0f;
-    rect.blue = static_cast<float>(GetBValue(color)) / 255.0f;
-    rect.alpha = 1.0f;
-    data.overlays.push_back(rect);
+    auto &line = g_state.lines[g_dragLine];
+    const double pixel = ((line.vertical ? x : y) - (line.vertical ? g_layout.originX : g_layout.originY)) /
+                         g_layout.pxPerIn * g_state.imagePpi;
+    if (pixel != line.position && std::isfinite(pixel) && std::abs(pixel) <= 1000000000.0)
+    {
+        g_history.captureGuides(g_state.lines);
+        line.position = pixel;
+        markDocumentModified();
+        requestCanvasRender();
+    }
+}
+void scrollPaletteTo(int y)
+{
+    const auto p = layoutPalette(g_surfaceWidth, g_uiScale, g_state.palette.size(), g_surfaceHeight);
+    const auto maximum = clampPaletteOffset(p, g_state.palette.size(), g_state.palette.size());
+    const double at = std::clamp(double(y - p.track.top) / std::max(1, p.track.bottom - p.track.top), 0.0, 1.0);
+    g_state.paletteOffset = clampPaletteOffset(p, g_state.palette.size(), std::size_t(at * maximum));
+    requestRender();
 }
 
-void addOverlayRectD(CanvasRenderData& data, double x, double y, double width, double height, COLORREF color, std::uint32_t surfaceWidth, std::uint32_t surfaceHeight)
+void zoomCanvas(double factor, int anchorX, int anchorY)
 {
-    addOverlayRect(
-        data,
-        static_cast<std::int32_t>(std::round(x)),
-        static_cast<std::int32_t>(std::round(y)),
-        static_cast<std::uint32_t>(std::max(1.0, std::round(width))),
-        static_cast<std::uint32_t>(std::max(1.0, std::round(height))),
-        color,
-        surfaceWidth,
-        surfaceHeight);
-}
-
-void buildOverlayGeometry(CanvasRenderData& data, std::uint32_t width, std::uint32_t height, const CanvasLayout& layout)
-{
-    const COLORREF rulerBackground = RGB(184, 184, 184);
-    const COLORREF gridRed = RGB(155, 0, 14);
-    const COLORREF hotRed = RGB(194, 0, 23);
-
-    const double pxPerIn = layout.pxPerIn;
-    const double originX = layout.originX;
-    const double originY = layout.originY;
-    const double canvasWidth = g_state.canvasWidthIn * pxPerIn;
-    const double canvasHeight = g_state.canvasHeightIn * pxPerIn;
-    const double canvasRight = originX + canvasWidth;
-    const double canvasBottom = originY + canvasHeight;
-
-    const std::size_t gridColumns = static_cast<std::size_t>(std::floor(g_state.canvasWidthIn / std::max(0.001, g_state.gridSizeIn))) + 1;
-    const std::size_t gridRows = static_cast<std::size_t>(std::floor(g_state.canvasHeightIn / std::max(0.001, g_state.gridSizeIn))) + 1;
-    const std::size_t gridReserve = g_state.showGrid ? gridColumns + gridRows + 4 : 0;
-
-    if (g_state.showRulers)
-    {
-        const double maxRulerXIn = std::max({g_state.canvasWidthIn, g_state.hasImage ? g_state.offsetXIn + g_state.imageWidthIn : 0.0, 0.0});
-        const double maxRulerYIn = std::max({g_state.canvasHeightIn, g_state.hasImage ? g_state.offsetYIn + g_state.imageHeightIn : 0.0, 0.0});
-
-        const std::size_t tickCountX = static_cast<std::size_t>(std::floor(maxRulerXIn / 0.25)) + 1;
-        const std::size_t tickCountY = static_cast<std::size_t>(std::floor(maxRulerYIn / 0.25)) + 1;
-        data.overlays.reserve(data.overlays.size() + tickCountX + tickCountY + 3 + gridReserve);
-
-        addOverlayRectD(data, originX, originY - kRulerThickness, maxRulerXIn * pxPerIn, kRulerThickness, rulerBackground, width, height);
-        addOverlayRectD(data, originX - kRulerThickness, originY, kRulerThickness, maxRulerYIn * pxPerIn, rulerBackground, width, height);
-
-        constexpr double quarter = 0.25;
-        for (int index = 0; index <= static_cast<int>(std::floor(maxRulerXIn / quarter)); ++index)
-        {
-            const double inch = static_cast<double>(index) * quarter;
-            const bool whole = std::abs(inch - std::round(inch)) < 0.0001;
-            const bool half = std::abs(inch * 2.0 - std::round(inch * 2.0)) < 0.0001;
-            const double length = whole ? 14.0 : (half ? 9.0 : 5.0);
-            const double tickWidth = whole ? 2.0 : 1.0;
-            const double x = originX + inch * pxPerIn;
-            addOverlayRectD(data, x, originY - length, tickWidth, length, gridRed, width, height);
-        }
-
-        for (int index = 0; index <= static_cast<int>(std::floor(maxRulerYIn / quarter)); ++index)
-        {
-            const double inch = static_cast<double>(index) * quarter;
-            const bool whole = std::abs(inch - std::round(inch)) < 0.0001;
-            const bool half = std::abs(inch * 2.0 - std::round(inch * 2.0)) < 0.0001;
-            const double length = whole ? 14.0 : (half ? 9.0 : 5.0);
-            const double tickWidth = whole ? 2.0 : 1.0;
-            const double y = originY + inch * pxPerIn;
-            addOverlayRectD(data, originX - length, y, length, tickWidth, gridRed, width, height);
-        }
-
-        addOverlayRectD(data, originX - 2.0, originY - 2.0, 4.0, 4.0, hotRed, width, height);
-    }
-
-    if (!g_state.showGrid)
-        return;
-
-    if (!g_state.showRulers)
-        data.overlays.reserve(data.overlays.size() + gridReserve);
-
-    const double gridStep = std::max(0.001, g_state.gridSizeIn) * pxPerIn;
-    const int fullColumns = static_cast<int>(gridColumns) - 1;
-    const int fullRows = static_cast<int>(gridRows) - 1;
-
-    for (int column = 0; column <= fullColumns; ++column)
-    {
-        const bool major = g_state.majorEvery > 0 && column % g_state.majorEvery == 0;
-        const double x = originX + static_cast<double>(column) * gridStep;
-        addOverlayRectD(data, x, originY, major ? 2.0 : 1.0, canvasHeight, major ? hotRed : gridRed, width, height);
-    }
-
-    for (int row = 0; row <= fullRows; ++row)
-    {
-        const bool major = g_state.majorEvery > 0 && row % g_state.majorEvery == 0;
-        const double y = originY + static_cast<double>(row) * gridStep;
-        addOverlayRectD(data, originX, y, canvasWidth, major ? 2.0 : 1.0, major ? hotRed : gridRed, width, height);
-    }
-
-    addOverlayRectD(data, originX, originY, canvasWidth, 2.0, hotRed, width, height);
-    addOverlayRectD(data, originX, canvasBottom - 2.0, canvasWidth, 2.0, hotRed, width, height);
-    addOverlayRectD(data, originX, originY, 2.0, canvasHeight, hotRed, width, height);
-    addOverlayRectD(data, canvasRight - 2.0, originY, 2.0, canvasHeight, hotRed, width, height);
+    const double localX = (anchorX - g_layout.originX) / g_layout.pxPerIn;
+    const double localY = (anchorY - g_layout.originY) / g_layout.pxPerIn;
+    g_state.zoomScale =
+        clampDouble(g_state.zoomScale * factor, std::min(1.0, originalZoomScale(g_state, g_layout)) / 128,
+                    std::max(1.0, originalZoomScale(g_state, g_layout)) * 128);
+    const auto next = computeLayout(g_surfaceWidth, g_surfaceHeight);
+    g_panX += anchorX - (next.originX + localX * next.pxPerIn);
+    g_panY += anchorY - (next.originY + localY * next.pxPerIn);
+    requestCanvasRender();
 }
 
 bool pointInsideImage(int x, int y)
 {
-    if (!g_state.hasImage)
+    if (!g_state.hasImage || !insideWorkspace(x, y))
         return false;
 
     const double imageX = g_layout.originX + g_state.offsetXIn * g_layout.pxPerIn;
     const double imageY = g_layout.originY + g_state.offsetYIn * g_layout.pxPerIn;
     const double imageWidth = g_state.imageWidthIn * g_layout.pxPerIn;
     const double imageHeight = g_state.imageHeightIn * g_layout.pxPerIn;
-    return x >= imageX && y >= imageY && x <= imageX + imageWidth && y <= imageY + imageHeight;
+    return x >= imageX && y >= imageY && x < imageX + imageWidth && y < imageY + imageHeight;
 }
 
-void updateProbe(int x, int y)
+bool pointToGridCell(int x, int y, int &cellX, int &cellY)
 {
-    g_state.probeValid = false;
-    g_state.probeText = L"Move over image";
-
-    if (!g_state.hasImage || g_state.image.width == 0 || g_state.image.height == 0 || g_layout.pxPerIn <= 0.0)
-    {
-        if (g_rightPanel.hwnd)
-            InvalidateRect(g_rightPanel.hwnd, nullptr, FALSE);
-        return;
-    }
-
-    const double absoluteXIn = (static_cast<double>(x) - g_layout.originX) / g_layout.pxPerIn;
-    const double absoluteYIn = (static_cast<double>(y) - g_layout.originY) / g_layout.pxPerIn;
-    const double imageLocalXIn = absoluteXIn - g_state.offsetXIn;
-    const double imageLocalYIn = absoluteYIn - g_state.offsetYIn;
-
-    if (imageLocalXIn < 0.0 || imageLocalYIn < 0.0 || imageLocalXIn >= g_state.imageWidthIn || imageLocalYIn >= g_state.imageHeightIn)
-    {
-        if (g_rightPanel.hwnd)
-            InvalidateRect(g_rightPanel.hwnd, nullptr, FALSE);
-        return;
-    }
-
-    const UINT px = static_cast<UINT>(std::clamp<double>(std::floor((imageLocalXIn / g_state.imageWidthIn) * g_state.image.width), 0.0, static_cast<double>(g_state.image.width - 1)));
-    const UINT py = static_cast<UINT>(std::clamp<double>(std::floor((imageLocalYIn / g_state.imageHeightIn) * g_state.image.height), 0.0, static_cast<double>(g_state.image.height - 1)));
-    const std::size_t index = (static_cast<std::size_t>(py) * g_state.image.width + px) * 4;
-    if (index + 3 >= g_state.image.pixels.size())
-        return;
-
-    g_state.probeColor.blue = g_state.image.pixels[index + 0];
-    g_state.probeColor.green = g_state.image.pixels[index + 1];
-    g_state.probeColor.red = g_state.image.pixels[index + 2];
-    g_state.probeColor.count = 1;
-    g_state.probeValid = true;
-
-    wchar_t text[160] = {};
-    std::swprintf(
-        text,
-        std::size(text),
-        L"%ls  rgb(%u, %u, %u)  px %u,%u",
-        formatHex(g_state.probeColor).c_str(),
-        g_state.probeColor.red,
-        g_state.probeColor.green,
-        g_state.probeColor.blue,
-        px,
-        py);
-    g_state.probeText = text;
-
-    if (g_rightPanel.hwnd)
-        InvalidateRect(g_rightPanel.hwnd, nullptr, FALSE);
-}
-
-void updateCursorSummary(int x, int y)
-{
-    if (g_layout.pxPerIn <= 0.0)
-        return;
+    if (!pointInsideImage(x, y) || g_layout.pxPerIn <= 0.0)
+        return false;
 
     const double xIn = (static_cast<double>(x) - g_layout.originX) / g_layout.pxPerIn;
     const double yIn = (static_cast<double>(y) - g_layout.originY) / g_layout.pxPerIn;
-    if (xIn < 0.0 || yIn < 0.0 || xIn > g_state.canvasWidthIn || yIn > g_state.canvasHeightIn)
-    {
-        g_state.cursorSummary = L"-";
-        updateStatusControls();
-        return;
-    }
+    if (xIn < 0.0 || yIn < 0.0 || xIn >= g_state.canvasWidthIn || yIn >= g_state.canvasHeightIn)
+        return false;
 
-    const double gridSize = std::max(0.001, g_state.gridSizeIn);
-    const int cellX = static_cast<int>(std::floor(xIn / gridSize));
-    const int cellY = static_cast<int>(std::floor(yIn / gridSize));
-    const int unitsPerCell = static_cast<int>(std::round(gridSize * 1000.0));
-    const int localX = static_cast<int>(std::clamp<double>(std::round((xIn - cellX * gridSize) * 1000.0), 0.0, std::max(0, unitsPerCell - 1)));
-    const int localY = static_cast<int>(std::clamp<double>(std::round((yIn - cellY * gridSize) * 1000.0), 0.0, std::max(0, unitsPerCell - 1)));
-
-    wchar_t text[160] = {};
-    std::swprintf(text, std::size(text), L"X:%d Y:%d  cell %d,%d  %.3f in, %.3f in", localX, localY, cellX, cellY, xIn, yIn);
-    g_state.cursorSummary = text;
-    updateStatusControls();
+    cellX = static_cast<int>(std::floor(xIn / g_state.gridSizeIn));
+    cellY = static_cast<int>(std::floor(yIn / g_state.gridSizeIn));
+    return true;
 }
 
-void computePalette()
+void markDirtyPixels(int left, int top, int right, int bottom, bool upload = true)
 {
-    g_state.palette.clear();
-    if (!g_state.hasImage || g_state.image.pixels.empty())
-        return;
-
-    struct Accumulator
+    ++g_pixelsRevision;
+    if (upload)
     {
-        std::uint64_t red = 0;
-        std::uint64_t green = 0;
-        std::uint64_t blue = 0;
-        std::uint32_t count = 0;
+        const RECT changed{left, top, right, bottom};
+        if (!g_hasDirtyPixels)
+            g_dirtyPixels = changed;
+        else
+        {
+            RECT combined{};
+            UnionRect(&combined, &g_dirtyPixels, &changed);
+            g_dirtyPixels = combined;
+        }
+        g_hasDirtyPixels = true;
+    }
+    const bool hadChanges = g_documentModified;
+    markDocumentModified();
+    if (!hadChanges)
+        refreshDocumentTitle();
+}
+
+PaletteColor &editingPaintColor()
+{
+    return g_state.secondaryActive ? g_state.secondaryColor : g_state.paintColor;
+}
+void setSecondaryActive(bool active)
+{
+    if (g_state.secondaryActive != active)
+    {
+        g_state.secondaryActive = active;
+        requestRender();
+    }
+}
+void choosePaintColor(HWND owner, bool secondary)
+{
+    static COLORREF customColors[16]{};
+    const auto old = secondary ? g_state.secondaryColor : g_state.paintColor;
+    CHOOSECOLORW choice{};
+    choice.lStructSize = sizeof(choice);
+    choice.hwndOwner = owner;
+    choice.rgbResult = RGB(old.red, old.green, old.blue);
+    choice.lpCustColors = customColors;
+    choice.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (ChooseColorW(&choice))
+    {
+        auto &color = secondary ? g_state.secondaryColor : g_state.paintColor;
+        color = {GetRValue(choice.rgbResult), GetGValue(choice.rgbResult), GetBValue(choice.rgbResult)};
+    }
+    setSecondaryActive((GetKeyState(VK_MENU) & 0x8000) != 0);
+}
+void paintPixelRegion(PaintRegion region)
+{
+    const auto [left, top, right, bottom] = region;
+    if (region.empty())
+        return;
+    g_history.capture(g_state.image(), left, top, right, bottom, g_state.cels[g_state.activeCel].id);
+    const auto &ink = activePaintColor(g_state);
+    const std::uint32_t color =
+        std::uint32_t(ink.blue) | (std::uint32_t(ink.green) << 8) | (std::uint32_t(ink.red) << 16) | 0xff000000u;
+    auto *pixels = g_state.image().pixels.data();
+    const auto paint = [&](std::size_t begin, std::size_t end) {
+        for (auto row = begin; row < end; ++row)
+            fillPixelSpan(pixels + ((std::size_t(top) + row) * g_state.image().width + left) * 4, right - left, color);
     };
+    if (std::size_t(right - left) * (bottom - top) >= 1048576)
+        parallelCpuRange(bottom - top, 32, paint);
+    else
+        paint(0, bottom - top);
+    const bool computed = paintVulkanCanvasRegion(left, top, right - left, bottom - top, color);
+    markDirtyPixels(left, top, right, bottom, !computed);
+}
 
-    std::unordered_map<std::uint16_t, Accumulator> buckets;
-    const std::size_t pixelCount = static_cast<std::size_t>(g_state.image.width) * g_state.image.height;
-    const std::size_t stride = std::max<std::size_t>(1, pixelCount / 240000);
+void paintGridCell(int cellX, int cellY)
+{
+    if (!g_state.hasImage || g_state.image().pixels.empty())
+        return;
 
-    for (std::size_t pixel = 0; pixel < pixelCount; pixel += stride)
+    const double leftIn = static_cast<double>(cellX) * g_state.gridSizeIn - g_state.offsetXIn;
+    const double topIn = static_cast<double>(cellY) * g_state.gridSizeIn - g_state.offsetYIn;
+    const double rightIn = std::min((cellX + 1) * g_state.gridSizeIn, g_state.canvasWidthIn) - g_state.offsetXIn;
+    const double bottomIn = std::min((cellY + 1) * g_state.gridSizeIn, g_state.canvasHeightIn) - g_state.offsetYIn;
+    const int imageWidth = static_cast<int>(g_state.image().width);
+    const int imageHeight = static_cast<int>(g_state.image().height);
+    const auto pixelEdge = [](double inches, double extentIn, int pixels) {
+        const double scaled = std::round(inches / extentIn * pixels * 1000000.0) / 1000000.0;
+        return static_cast<int>(std::clamp(std::floor(scaled), 0.0, static_cast<double>(pixels)));
+    };
+    const int left = pixelEdge(leftIn, g_state.imageWidthIn, imageWidth);
+    const int top = pixelEdge(topIn, g_state.imageHeightIn, imageHeight);
+    const int right = pixelEdge(rightIn, g_state.imageWidthIn, imageWidth);
+    const int bottom = pixelEdge(bottomIn, g_state.imageHeightIn, imageHeight);
+    if (left >= right || top >= bottom)
+        return;
+
+    paintPixelRegion({left, top, right, bottom});
+}
+
+bool pointToImagePixel(int x, int y, int &px, int &py)
+{
+    if (!pointInsideImage(x, y))
+        return false;
+    const double localX = (x - g_layout.originX) / g_layout.pxPerIn - g_state.offsetXIn;
+    const double localY = (y - g_layout.originY) / g_layout.pxPerIn - g_state.offsetYIn;
+    const auto &image = g_state.image();
+    px = std::clamp(int(localX / g_state.imageWidthIn * image.width), 0, int(image.width) - 1);
+    py = std::clamp(int(localY / g_state.imageHeightIn * image.height), 0, int(image.height) - 1);
+    return true;
+}
+bool pointToPaintPosition(int x, int y, int &px, int &py)
+{
+    if (!g_state.cels[g_state.activeCel].visible)
+        return false;
+    if (g_state.tool == PaintTool::Cell)
+        return pointToGridCell(x, y, px, py);
+    return g_state.tool == PaintTool::Brush && pointToImagePixel(x, y, px, py);
+}
+void paintPosition(int x, int y)
+{
+    if (g_state.tool == PaintTool::Brush)
+        paintPixelRegion(brushRegion(x, y, g_state.brushSize, g_state.image().width, g_state.image().height));
+    else if (g_state.tool == PaintTool::Cell)
+        paintGridCell(x, y);
+}
+void continueStroke(int targetX, int targetY)
+{
+    if (g_state.tool == PaintTool::Brush)
+        continueBrushLine(g_drag.lastX, g_drag.lastY, targetX, targetY, g_state.brushSize, g_state.image().width,
+                          g_state.image().height, paintPixelRegion);
+    else
+        continuePaintLine(g_drag.lastX, g_drag.lastY, targetX, targetY, paintPosition);
+    g_drag.lastX = targetX;
+    g_drag.lastY = targetY;
+    requestRender();
+}
+void advanceStrokeAt(int x, int y)
+{
+    int px = 0, py = 0;
+    if (!pointToPaintPosition(x, y, px, py))
     {
-        const std::size_t byteIndex = pixel * 4;
-        if (byteIndex + 3 >= g_state.image.pixels.size())
-            break;
-
-        const std::uint8_t blue = g_state.image.pixels[byteIndex + 0];
-        const std::uint8_t green = g_state.image.pixels[byteIndex + 1];
-        const std::uint8_t red = g_state.image.pixels[byteIndex + 2];
-        const std::uint8_t alpha = g_state.image.pixels[byteIndex + 3];
-        if (alpha == 0)
-            continue;
-
-        const std::uint16_t key = static_cast<std::uint16_t>(((red >> 4) << 8) | ((green >> 4) << 4) | (blue >> 4));
-        Accumulator& bucket = buckets[key];
-        bucket.red += red;
-        bucket.green += green;
-        bucket.blue += blue;
-        ++bucket.count;
+        g_drag.havePosition = false;
+        return;
     }
-
-    std::vector<PaletteColor> colors;
-    colors.reserve(buckets.size());
-    for (const auto& entry : buckets)
+    if (!g_drag.havePosition)
     {
-        const Accumulator& bucket = entry.second;
-        if (bucket.count == 0)
-            continue;
-
-        PaletteColor color;
-        color.red = static_cast<std::uint8_t>(bucket.red / bucket.count);
-        color.green = static_cast<std::uint8_t>(bucket.green / bucket.count);
-        color.blue = static_cast<std::uint8_t>(bucket.blue / bucket.count);
-        color.count = bucket.count;
-        colors.push_back(color);
+        paintPosition(px, py);
+        g_drag.lastX = px;
+        g_drag.lastY = py;
+        requestRender();
     }
-
-    std::sort(colors.begin(), colors.end(), [](const PaletteColor& left, const PaletteColor& right) {
-        return left.count > right.count;
-    });
-
-    const std::size_t desired = static_cast<std::size_t>(std::clamp(g_state.paletteCount, 8, 64));
-    for (const PaletteColor& color : colors)
+    else if (px != g_drag.lastX || py != g_drag.lastY)
+        continueStroke(px, py);
+    g_drag.havePosition = true;
+}
+void selectPaintTool(PaintTool tool)
+{
+    if (g_drag.painting)
     {
-        bool tooClose = false;
-        for (const PaletteColor& selected : g_state.palette)
-        {
-            const int dr = static_cast<int>(color.red) - static_cast<int>(selected.red);
-            const int dg = static_cast<int>(color.green) - static_cast<int>(selected.green);
-            const int db = static_cast<int>(color.blue) - static_cast<int>(selected.blue);
-            if (dr * dr + dg * dg + db * db < 900)
+        g_drag.painting = false;
+        g_history.commit();
+        schedulePalette();
+        if (GetCapture() == g_parent)
+            ReleaseCapture();
+    }
+    g_state.tool = tool;
+    g_brushWheelDelta = 0;
+    requestRender();
+}
+
+void finishCelStroke()
+{
+    const bool painted = g_drag.painting;
+    g_drag.painting = false;
+    g_history.commit();
+    if (GetCapture() == g_parent)
+        ReleaseCapture();
+    flushCanvasCaliperEdits();
+    if (painted)
+        schedulePalette();
+}
+void revealActiveCel()
+{
+    const auto list = layoutCels(g_surfaceWidth, g_surfaceHeight, g_uiScale);
+    const auto row = g_state.cels.size() - 1 - g_state.activeCel;
+    if (row < g_state.celOffset)
+        g_state.celOffset = row;
+    else if (row >= g_state.celOffset + list.rows)
+        g_state.celOffset = row - list.rows + 1;
+}
+void commitCelChange()
+{
+    ++g_pixelsRevision;
+    g_history.commit();
+    g_hasDirtyPixels = false;
+    markDocumentModified();
+    setVulkanCels(g_state);
+    schedulePalette();
+    revealActiveCel();
+    requestCanvasRender();
+}
+void createCel(bool duplicate)
+{
+    if (!g_state.hasImage || g_state.celBusy || g_state.cels.size() >= kMaxCels ||
+        std::uint64_t(g_state.image().width) * g_state.image().height * (g_state.cels.size() + 1) > kMaxCelPixels)
+        return;
+    finishCelStroke();
+    g_state.celBusy = true;
+    const auto epoch = g_epoch;
+    const auto source = duplicate ? g_state.image() : DecodedImage{g_state.image().width, g_state.image().height, {}};
+    const auto name = duplicate ? g_state.cels[g_state.activeCel].name + L" copy" : L"";
+    startCpuJob(
+        duplicate ? L"Duplicating cel..." : L"Creating cel...",
+        [source, duplicate] {
+            DecodedImage image;
+            if (duplicate)
             {
-                tooClose = true;
-                break;
+                image = source;
+                image.pixels.data();
             }
-        }
-
-        if (!tooClose)
-            g_state.palette.push_back(color);
-        if (g_state.palette.size() >= desired)
-            break;
-    }
-
-    for (const PaletteColor& color : colors)
+            else
+            {
+                image.width = source.width;
+                image.height = source.height;
+                image.pixels.resize(std::size_t(source.width) * source.height * 4);
+            }
+            return image;
+        },
+        [epoch, name](DecodedImage image) {
+            if (epoch != g_epoch)
+                return;
+            g_state.celBusy = false;
+            if (std::uint64_t(image.width) * image.height * (g_state.cels.size() + 1) > kMaxCelPixels ||
+                g_state.cels.size() >= kMaxCels)
+                return;
+            finishCelStroke();
+            g_history.captureCels(g_state);
+            Cel cel;
+            while (!g_nextCelId || std::any_of(g_state.cels.begin(), g_state.cels.end(),
+                                               [](const auto &item) { return item.id == g_nextCelId; }))
+                ++g_nextCelId;
+            cel.id = g_nextCelId++;
+            cel.name = name.empty() ? L"Cel " + std::to_wstring(cel.id) : name;
+            cel.image = std::move(image);
+            const auto at = g_state.activeCel + 1;
+            g_state.cels.insert(g_state.cels.begin() + at, std::move(cel));
+            g_state.activeCel = at;
+            commitCelChange();
+        },
+        [epoch] {
+            if (epoch == g_epoch)
+                g_state.celBusy = false;
+        });
+}
+void handleCelAction(HWND owner, int action)
+{
+    if (action == UI_CEL_SCROLL)
     {
-        if (g_state.palette.size() >= desired)
-            break;
-        if (std::find_if(g_state.palette.begin(), g_state.palette.end(), [&](const PaletteColor& selected) {
-                return selected.red == color.red && selected.green == color.green && selected.blue == color.blue;
-            }) == g_state.palette.end())
+        g_dragCels = true;
+        SetCapture(owner);
+        return;
+    }
+    if (!g_state.hasImage)
+        return;
+    if (action == UI_CEL_NEW || action == UI_CEL_DUPLICATE)
+    {
+        createCel(action == UI_CEL_DUPLICATE);
+        return;
+    }
+    finishCelStroke();
+    if (action >= UI_CEL_SELECT_FIRST && action < UI_CEL_SELECT_FIRST + int(kMaxCels))
+    {
+        const auto index = std::uint32_t(action - UI_CEL_SELECT_FIRST);
+        if (index < g_state.cels.size())
         {
-            g_state.palette.push_back(color);
+            g_state.activeCel = index;
+            selectVulkanCel(index);
+            revealActiveCel();
+            requestCanvasRender();
         }
+        return;
     }
-}
-
-// The top toolbar is Vulkan-rendered (not a Win32 toolbar control): there is no
-// text/glyph pipeline in the renderer yet, so the strip is rasterized once with
-// GDI (background fill + placeholder emoji "icons") into an off-screen bitmap,
-// uploaded as a Vulkan texture, and blitted onto the swapchain every frame the
-// same way the canvas image is. It only needs to be regenerated when the window
-// width (or menu color) changes, not every frame.
-struct ToolbarIconSpec
-{
-    const wchar_t* glyph;
-};
-
-// Rough-in placeholders standing in for real tool icons later on. First slot is
-// the pointer/selection tool per the initial design direction.
-constexpr std::array<ToolbarIconSpec, 8> kToolbarIcons = {{
-    {L"\U0001F5B1"},  // pointer / selection
-    {L"\U0001F590"},  // pan / hand
-    {L"\U0001F58C"},  // brush
-    {L"\U0001FAA3"},  // fill bucket
-    {L"\U0001F9FD"},  // eraser
-    {L"\U0001F50D"},  // zoom
-    {L"\U0001F4D0"},  // ruler / caliper
-    {L"\U0001F3A8"},  // palette / color
-}};
-
-HFONT g_toolbarIconFont = nullptr;
-std::uint32_t g_toolbarTextureWidth = 0;
-
-void renderToolbarBitmap(std::uint32_t width, DecodedImage& outImage)
-{
-    outImage = {};
-    if (width == 0)
-        return;
-
-    const UINT bitmapWidth = width;
-    const UINT bitmapHeight = static_cast<UINT>(kTopToolbarHeight);
-
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(bitmapWidth);
-    bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(bitmapHeight);
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-    HDC screenDc = GetDC(nullptr);
-    if (!screenDc)
-        return;
-    HDC memoryDc = CreateCompatibleDC(screenDc);
-    ReleaseDC(nullptr, screenDc);
-    if (!memoryDc)
-        return;
-
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(memoryDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (!bitmap || !pixels)
+    if (action >= UI_CEL_VISIBLE_FIRST && action < UI_CEL_VISIBLE_FIRST + int(kMaxCels))
     {
-        if (bitmap)
-            DeleteObject(bitmap);
-        DeleteDC(memoryDc);
+        const auto index = std::size_t(action - UI_CEL_VISIBLE_FIRST);
+        if (index < g_state.cels.size())
+        {
+            g_history.captureCels(g_state);
+            g_state.cels[index].visible = !g_state.cels[index].visible;
+            g_history.commit();
+            markDocumentModified();
+            setVulkanCelVisibility(std::uint32_t(index), g_state.cels[index].visible);
+            requestCanvasRender();
+        }
         return;
     }
-
-    HGDIOBJ previousBitmap = SelectObject(memoryDc, bitmap);
-
-    // Match whatever the OS is actually rendering for the native menu bar above
-    // this strip, so the boundary between the two reads as one continuous bar.
-    const COLORREF menuColor = GetSysColor(COLOR_MENUBAR);
-    RECT fullRect{0, 0, static_cast<int>(bitmapWidth), static_cast<int>(bitmapHeight)};
-    HBRUSH menuBrush = CreateSolidBrush(menuColor);
-    FillRect(memoryDc, &fullRect, menuBrush);
-    DeleteObject(menuBrush);
-
-    if (!g_toolbarIconFont)
+    if (action == UI_CEL_RENAME)
     {
-        LOGFONTW font{};
-        font.lfHeight = -20;
-        font.lfWeight = FW_NORMAL;
-        font.lfCharSet = DEFAULT_CHARSET;
-        font.lfQuality = CLEARTYPE_QUALITY;
-        wcscpy_s(font.lfFaceName, LF_FACESIZE, L"Segoe UI Emoji");
-        g_toolbarIconFont = CreateFontIndirectW(&font);
+        renameActiveCel(owner);
+        return;
     }
-
-    HGDIOBJ previousFont = g_toolbarIconFont ? SelectObject(memoryDc, g_toolbarIconFont) : nullptr;
-    SetBkMode(memoryDc, TRANSPARENT);
-    SetTextColor(memoryDc, RGB(235, 235, 235));
-
-    for (std::size_t index = 0; index < kToolbarIcons.size(); ++index)
+    if (action == UI_CEL_DELETE && g_state.cels.size() > 1)
     {
-        const int slotLeft = static_cast<int>(index) * kTopToolbarIconSlot;
-        if (slotLeft >= static_cast<int>(bitmapWidth))
-            break;
-
-        RECT slotRect{slotLeft, 0, std::min(static_cast<int>(bitmapWidth), slotLeft + kTopToolbarIconSlot), static_cast<int>(bitmapHeight)};
-        DrawTextW(memoryDc, kToolbarIcons[index].glyph, -1, &slotRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+        g_history.captureCels(g_state);
+        g_state.cels.erase(g_state.cels.begin() + g_state.activeCel);
+        g_state.activeCel = std::min(g_state.activeCel, std::uint32_t(g_state.cels.size() - 1));
+        commitCelChange();
     }
-
-    if (previousFont)
-        SelectObject(memoryDc, previousFont);
-    SelectObject(memoryDc, previousBitmap);
-
-    outImage.width = bitmapWidth;
-    outImage.height = bitmapHeight;
-    outImage.pixels.resize(static_cast<std::size_t>(bitmapWidth) * bitmapHeight * 4);
-    std::memcpy(outImage.pixels.data(), pixels, outImage.pixels.size());
-    for (std::size_t index = 3; index < outImage.pixels.size(); index += 4)
-        outImage.pixels[index] = 255;
-
-    DeleteObject(bitmap);
-    DeleteDC(memoryDc);
+    if ((action == UI_CEL_UP && g_state.activeCel + 1 < g_state.cels.size()) ||
+        (action == UI_CEL_DOWN && g_state.activeCel > 0))
+    {
+        g_history.captureCels(g_state);
+        const auto next = action == UI_CEL_UP ? g_state.activeCel + 1 : g_state.activeCel - 1;
+        std::swap(g_state.cels[g_state.activeCel], g_state.cels[next]);
+        g_state.activeCel = next;
+        commitCelChange();
+    }
+}
+void updateProbe(int x, int y)
+{
+    int px = 0, py = 0;
+    if ((g_state.probeValid = pointToImagePixel(x, y, px, py)))
+    {
+        const auto [blue, green, red, alpha] = sampleCels(g_state, px, py);
+        g_state.probeColor = {red, green, blue};
+        wchar_t text[96];
+        std::swprintf(text, std::size(text), L"#%02X%02X%02X  rgb(%u, %u, %u)  px %d,%d", unsigned(red),
+                      unsigned(green), unsigned(blue), unsigned(red), unsigned(green), unsigned(blue), px, py);
+        g_state.probeText = text;
+    }
+    requestRender();
 }
 
-void ensureToolbarTexture(std::uint32_t width)
+void schedulePalette()
 {
-    if (width == 0 || width == g_toolbarTextureWidth)
+    g_paletteDirty = true;
+    if (g_paletteRunning || !g_state.hasImage)
         return;
-
-    DecodedImage image;
-    renderToolbarBitmap(width, image);
-    if (image.width == 0)
-        return;
-
-    setVulkanToolbarImage(image);
-    g_toolbarTextureWidth = width;
+    g_paletteRunning = true;
+    g_paletteDirty = false;
+    g_state.paletteUpdating = true;
+    const auto epoch = g_epoch, revision = g_pixelsRevision;
+    const CelStack snapshot = g_state;
+    startCpuJob(
+        L"Analyzing colors...", [snapshot] { return collectCelColors(snapshot); },
+        [epoch, revision](std::vector<PaletteColor> colors) {
+            g_paletteRunning = false;
+            g_state.paletteUpdating = false;
+            if (epoch == g_epoch && revision == g_pixelsRevision)
+            {
+                g_state.palette = std::move(colors);
+                const auto p = layoutPalette(g_surfaceWidth, g_uiScale, g_state.palette.size(), g_surfaceHeight);
+                g_state.paletteOffset = clampPaletteOffset(p, g_state.palette.size(), g_state.paletteOffset);
+            }
+            if (g_paletteDirty)
+                schedulePalette();
+        },
+        [] {
+            g_paletteRunning = false;
+            g_state.paletteUpdating = false;
+        });
 }
-}
-
-void invalidateCanvasCaliperToolbar()
-{
-    g_toolbarTextureWidth = 0;
-}
-
-namespace
-{
 
 void applyPngSpecsToState()
 {
@@ -898,900 +750,337 @@ void applyPngSpecsToState()
         return;
 
     g_state.imagePpi = clampDouble(g_state.detectedPpi, 1.0, 5000.0);
-    g_state.imageWidthIn = clampDouble(static_cast<double>(g_state.image.width) / g_state.imagePpi, 0.01, 10000.0);
-    g_state.imageHeightIn = clampDouble(static_cast<double>(g_state.image.height) / g_state.imagePpi, 0.01, 10000.0);
-}
-
-void updateStatusControls()
-{
-    if (!g_controls.status)
-        return;
-
-    if (g_state.hasImage)
-    {
-        setControlText(g_controls.status, L"Loaded: " + g_state.imageName);
-
-        wchar_t pixels[96] = {};
-        std::swprintf(pixels, std::size(pixels), L"%u x %u px", g_state.image.width, g_state.image.height);
-        setControlText(g_controls.pixels, pixels);
-
-        wchar_t ppi[160] = {};
-        std::swprintf(ppi, std::size(ppi), L"%.2f (%ls)", g_state.detectedPpi, g_state.ppiSource.c_str());
-        setControlText(g_controls.ppi, ppi);
-
-        wchar_t sourceSize[96] = {};
-        std::swprintf(sourceSize, std::size(sourceSize), L"%.2f x %.2f in", static_cast<double>(g_state.image.width) / g_state.detectedPpi, static_cast<double>(g_state.image.height) / g_state.detectedPpi);
-        setControlText(g_controls.sourceSize, sourceSize);
-    }
-    else
-    {
-        setControlText(g_controls.status, L"No image loaded");
-        setControlText(g_controls.pixels, L"-");
-        setControlText(g_controls.ppi, L"-");
-        setControlText(g_controls.sourceSize, L"-");
-    }
-
-    wchar_t imageSummary[160] = {};
-    std::swprintf(imageSummary, std::size(imageSummary), L"%.2f x %.2f in @ %.2f PPI", g_state.imageWidthIn, g_state.imageHeightIn, g_state.imagePpi);
-    setControlText(g_controls.imageSummary, imageSummary);
-
-    wchar_t canvasSummary[128] = {};
-    std::swprintf(canvasSummary, std::size(canvasSummary), L"%.2f x %.2f in", g_state.canvasWidthIn, g_state.canvasHeightIn);
-    setControlText(g_controls.canvasSummary, canvasSummary);
-
-    const int cols = static_cast<int>(std::floor(g_state.canvasWidthIn / std::max(0.001, g_state.gridSizeIn)));
-    const int rows = static_cast<int>(std::floor(g_state.canvasHeightIn / std::max(0.001, g_state.gridSizeIn)));
-    wchar_t gridSummary[180] = {};
-    std::swprintf(gridSummary, std::size(gridSummary), L"%.2f in cells, %d x %d full cells", g_state.gridSizeIn, cols, rows);
-    setControlText(g_controls.gridSummary, gridSummary);
-
-    setControlText(g_controls.cursorSummary, g_state.cursorSummary);
-
-    wchar_t displaySummary[180] = {};
-    std::swprintf(displaySummary, std::size(displaySummary), L"%.2f px/in, fit %.2f, zoom %.2fx", g_layout.pxPerIn, g_layout.fitPxPerIn, g_state.zoomScale);
-    setControlText(g_controls.displaySummary, displaySummary);
-}
-
-void syncControlsFromState()
-{
-    g_syncingControls = true;
-    setControlText(g_controls.imageWidth, formatDouble(g_state.imageWidthIn));
-    setControlText(g_controls.imageHeight, formatDouble(g_state.imageHeightIn));
-    setControlText(g_controls.imagePpi, formatDouble(g_state.imagePpi));
-    setControlText(g_controls.canvasWidth, formatDouble(g_state.canvasWidthIn));
-    setControlText(g_controls.canvasHeight, formatDouble(g_state.canvasHeightIn));
-    setControlText(g_controls.gridSize, formatDouble(g_state.gridSizeIn));
-    setControlText(g_controls.majorEvery, formatInt(g_state.majorEvery));
-    setControlText(g_controls.offsetX, formatDouble(g_state.offsetXIn));
-    setControlText(g_controls.offsetY, formatDouble(g_state.offsetYIn));
-    setControlText(g_controls.zoom, formatDouble(g_state.zoomScale));
-    setControlText(g_controls.paletteCount, formatInt(g_state.paletteCount));
-    g_syncingControls = false;
-
-    updateStatusControls();
-    if (g_rightPanel.hwnd)
-        InvalidateRect(g_rightPanel.hwnd, nullptr, FALSE);
-}
-
-void readControlsToState()
-{
-    if (g_syncingControls)
-        return;
-
-    g_state.imageWidthIn = readControlDouble(g_controls.imageWidth, g_state.imageWidthIn, 0.01, 10000.0);
-    g_state.imageHeightIn = readControlDouble(g_controls.imageHeight, g_state.imageHeightIn, 0.01, 10000.0);
-    g_state.imagePpi = readControlDouble(g_controls.imagePpi, g_state.imagePpi, 1.0, 5000.0);
-    g_state.canvasWidthIn = readControlDouble(g_controls.canvasWidth, g_state.canvasWidthIn, 0.01, 10000.0);
-    g_state.canvasHeightIn = readControlDouble(g_controls.canvasHeight, g_state.canvasHeightIn, 0.01, 10000.0);
-    g_state.gridSizeIn = readControlDouble(g_controls.gridSize, g_state.gridSizeIn, 0.01, 10000.0);
-    g_state.majorEvery = readControlInt(g_controls.majorEvery, g_state.majorEvery, 0, 10000);
-    g_state.offsetXIn = snapQuarter(readControlDouble(g_controls.offsetX, g_state.offsetXIn, -10000.0, 10000.0));
-    g_state.offsetYIn = snapQuarter(readControlDouble(g_controls.offsetY, g_state.offsetYIn, -10000.0, 10000.0));
-    g_state.zoomScale = readControlDouble(g_controls.zoom, g_state.zoomScale, 1.0, kMaxZoom);
-    const int previousPaletteCount = g_state.paletteCount;
-    g_state.paletteCount = readControlInt(g_controls.paletteCount, g_state.paletteCount, 8, 64);
-    if (previousPaletteCount != g_state.paletteCount)
-        computePalette();
+    g_state.gridSizeIn = std::max(g_state.gridSizeIn, 1.0 / g_state.imagePpi);
+    g_state.imageWidthIn = clampDouble(static_cast<double>(g_state.image().width) / g_state.imagePpi, 0.0002, 16384.0);
+    g_state.imageHeightIn =
+        clampDouble(static_cast<double>(g_state.image().height) / g_state.imagePpi, 0.0002, 16384.0);
 }
 
 void requestCanvasRender()
 {
-    RECT client{};
-    if (g_parent && GetClientRect(g_parent, &client))
-        g_layout = computeLayout(static_cast<std::uint32_t>(client.right - client.left), static_cast<std::uint32_t>(client.bottom - client.top));
-
-    updateStatusControls();
-    saveCanvasCaliperConfig();
+    layoutCanvasCaliperChrome();
+    refreshDocumentTitle();
     requestRender();
 }
-
-void createLeftPanelControls(HWND parent)
-{
-    int y = kHeaderHeight + 8;
-    makeStatic(parent, L"PNG Source", 10, y, 210, 14);
-    y += 18;
-    g_controls.status = makeStatic(parent, L"No image loaded", 12, y, 216, 16);
-    y += 18;
-    g_controls.pixels = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.ppi = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.sourceSize = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 26;
-
-    auto addEditRow = [&](const wchar_t* label, HWND& target, UINT id) {
-        makeStatic(parent, label, 10, y + 4, 134, 18);
-        target = makeEdit(parent, id, 150, y, 74, 23);
-        y += 28;
-    };
-
-    makeStatic(parent, L"Reference Image Size", 10, y, 210, 14);
-    y += 20;
-    addEditRow(L"Image width (in)", g_controls.imageWidth, IDC_CC_IMAGE_WIDTH);
-    addEditRow(L"Image height (in)", g_controls.imageHeight, IDC_CC_IMAGE_HEIGHT);
-    addEditRow(L"Image PPI", g_controls.imagePpi, IDC_CC_IMAGE_PPI);
-
-    y += 8;
-    makeStatic(parent, L"Canvas / Grid Bounds", 10, y, 210, 14);
-    y += 20;
-    addEditRow(L"Canvas width (in)", g_controls.canvasWidth, IDC_CC_CANVAS_WIDTH);
-    addEditRow(L"Canvas height (in)", g_controls.canvasHeight, IDC_CC_CANVAS_HEIGHT);
-    addEditRow(L"Grid size (in)", g_controls.gridSize, IDC_CC_GRID_SIZE);
-    addEditRow(L"Major every", g_controls.majorEvery, IDC_CC_MAJOR_EVERY);
-
-    y += 8;
-    makeStatic(parent, L"Image Offset / Zoom", 10, y, 210, 14);
-    y += 20;
-    addEditRow(L"Offset X (in)", g_controls.offsetX, IDC_CC_OFFSET_X);
-    addEditRow(L"Offset Y (in)", g_controls.offsetY, IDC_CC_OFFSET_Y);
-    addEditRow(L"Zoom scale", g_controls.zoom, IDC_CC_ZOOM);
-    addEditRow(L"Swatches", g_controls.paletteCount, IDC_CC_PALETTE_COUNT);
-
-    y += 8;
-    makeButton(parent, IDC_CC_OPEN, L"Open Image", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_USE_PNG, L"Apply PPI", 122, y, 104, 25);
-    y += 31;
-    makeButton(parent, IDC_CC_RESET_OFFSET, L"Reset Offset", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_FIT_VIEW, L"Fit View", 122, y, 104, 25);
-    y += 31;
-    makeButton(parent, IDC_CC_ZOOM_OUT, L"Zoom -", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_ZOOM_IN, L"Zoom +", 122, y, 104, 25);
-    y += 31;
-    makeButton(parent, IDC_CC_CLEAR, L"Clear", 10, y, 104, 25);
-    makeButton(parent, IDC_CC_SAVE, L"Apply", 122, y, 104, 25);
-    y += 35;
-
-    makeStatic(parent, L"View", 10, y, 210, 14);
-    y += 18;
-    g_controls.imageSummary = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.canvasSummary = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.gridSummary = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.cursorSummary = makeStatic(parent, L"-", 12, y, 216, 16);
-    y += 18;
-    g_controls.displaySummary = makeStatic(parent, L"-", 12, y, 216, 16);
-}
-
-void paintRightPanel(HWND hwnd, HDC dc, const RECT& client)
-{
-    drawPanelText(dc, L"Palette", 10, kHeaderHeight + 8, client.right - 20, 20, RGB(242, 244, 247));
-
-    wchar_t info[128] = {};
-    if (g_state.palette.empty())
-        wcscpy_s(info, std::size(info), L"Load a PNG to generate swatches.");
-    else
-        std::swprintf(info, std::size(info), L"%zu computed swatches", g_state.palette.size());
-    drawPanelText(dc, info, 10, kHeaderHeight + 32, client.right - 20, 20, RGB(152, 162, 173));
-
-    const int columns = 4;
-    const int gap = 8;
-    const int swatchWidth = (client.right - 20 - gap * (columns - 1)) / columns;
-    const int swatchHeight = 72;
-    int x = 10;
-    int y = kHeaderHeight + 60;
-
-    const std::uint32_t total = std::max<std::uint32_t>(1, [&]() {
-        std::uint32_t value = 0;
-        for (const PaletteColor& color : g_state.palette)
-            value += color.count;
-        return value;
-    }());
-
-    for (std::size_t index = 0; index < g_state.palette.size(); ++index)
-    {
-        const PaletteColor& color = g_state.palette[index];
-        RECT colorRect{x, y, x + swatchWidth, y + 42};
-        HBRUSH brush = CreateSolidBrush(RGB(color.red, color.green, color.blue));
-        FillRect(dc, &colorRect, brush);
-        DeleteObject(brush);
-
-        RECT metaRect{x, y + 42, x + swatchWidth, y + swatchHeight};
-        FillRect(dc, &metaRect, g_editBrush);
-        drawPanelText(dc, formatHex(color), x + 5, y + 46, swatchWidth - 10, 13, RGB(242, 244, 247));
-
-        wchar_t percent[32] = {};
-        std::swprintf(percent, std::size(percent), L"%.1f%%", (static_cast<double>(color.count) / static_cast<double>(total)) * 100.0);
-        drawPanelText(dc, percent, x + 5, y + 59, swatchWidth - 10, 12, RGB(180, 185, 192));
-
-        x += swatchWidth + gap;
-        if ((index + 1) % columns == 0)
-        {
-            x = 10;
-            y += swatchHeight + gap;
-        }
-        if (y + swatchHeight > client.bottom - 122)
-            break;
-    }
-
-    RECT probeRect{10, client.bottom - 108, client.right - 10, client.bottom - 10};
-    FillRect(dc, &probeRect, g_editBrush);
-    drawPanelText(dc, L"Pixel Color", probeRect.left + 82, probeRect.top + 14, probeRect.right - probeRect.left - 92, 18, RGB(242, 244, 247));
-    drawPanelText(dc, g_state.probeText, probeRect.left + 82, probeRect.top + 36, probeRect.right - probeRect.left - 92, 42, RGB(152, 162, 173), DT_LEFT | DT_TOP | DT_WORDBREAK);
-
-    RECT colorBox{probeRect.left + 12, probeRect.top + 12, probeRect.left + 68, probeRect.bottom - 12};
-    const COLORREF probeColor = g_state.probeValid ? RGB(g_state.probeColor.red, g_state.probeColor.green, g_state.probeColor.blue) : RGB(0, 0, 0);
-    HBRUSH probeBrush = CreateSolidBrush(probeColor);
-    FillRect(dc, &colorBox, probeBrush);
-    DeleteObject(probeBrush);
-}
-
-void paintPanel(HWND hwnd, ToolPanel& panel)
-{
-    PAINTSTRUCT paint{};
-    HDC dc = BeginPaint(hwnd, &paint);
-    RECT client{};
-    GetClientRect(hwnd, &client);
-
-    FillRect(dc, &client, g_panelBrush);
-    SetBkMode(dc, TRANSPARENT);
-    if (g_uiFont)
-        SelectObject(dc, g_uiFont);
-
-    RECT header{0, 0, client.right, kHeaderHeight};
-    HBRUSH headerBrush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(dc, &header, headerBrush);
-    DeleteObject(headerBrush);
-
-    const std::wstring title = panel.kind == ToolbarKind::Left ? L"CanvasCaliper" : L"Palette";
-    drawPanelText(dc, title, 10, 8, client.right - 20, 18, RGB(242, 244, 247));
-    drawPanelText(dc, L"::", client.right - 26, 8, 16, 18, RGB(152, 162, 173), DT_RIGHT | DT_TOP | DT_SINGLELINE);
-
-    if (panel.kind == ToolbarKind::Right)
-        paintRightPanel(hwnd, dc, client);
-
-    EndPaint(hwnd, &paint);
-}
-
-void moveFloatingToolPanel(ToolPanel& panel, const RECT& rect)
-{
-    panel.dock = ToolbarDock::Floating;
-    panel.floatingRect = rect;
-    if (panel.hwnd)
-    {
-        MoveWindow(
-            panel.hwnd,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            TRUE);
-    }
-}
-
-void snapToolPanel(ToolPanel& panel)
-{
-    if (!g_parent || !panel.hwnd)
-        return;
-
-    RECT client{};
-    GetClientRect(g_parent, &client);
-    RECT rect{};
-    GetWindowRect(panel.hwnd, &rect);
-    POINT topLeft{rect.left, rect.top};
-    POINT bottomRight{rect.right, rect.bottom};
-    ScreenToClient(g_parent, &topLeft);
-    ScreenToClient(g_parent, &bottomRight);
-    rect = {topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
-
-    if (rect.left <= kSnapDistance)
-    {
-        panel.dock = ToolbarDock::Left;
-    }
-    else if (client.right - rect.right <= kSnapDistance)
-    {
-        panel.dock = ToolbarDock::Right;
-    }
-    else
-    {
-        panel.dock = ToolbarDock::Floating;
-        const int width = rect.right - rect.left;
-        const int height = rect.bottom - rect.top;
-        rect.left = std::clamp<LONG>(rect.left, 0, std::max<LONG>(0, client.right - width));
-        rect.top = std::clamp<LONG>(rect.top, kTopToolbarHeight, std::max<LONG>(kTopToolbarHeight, client.bottom - height));
-        rect.right = rect.left + width;
-        rect.bottom = rect.top + height;
-        panel.floatingRect = rect;
-    }
-
-    layoutCanvasCaliperChrome();
-    requestCanvasRender();
-}
-
-void beginPanelDrag(ToolPanel& panel)
-{
-    if (!panel.hwnd || !g_parent)
-        return;
-
-    panel.dragging = true;
-    GetCursorPos(&panel.dragStartScreen);
-    GetWindowRect(panel.hwnd, &panel.dragStartRect);
-    SetCapture(panel.hwnd);
-
-    if (panel.dock != ToolbarDock::Floating)
-    {
-        POINT topLeft{panel.dragStartRect.left, panel.dragStartRect.top};
-        ScreenToClient(g_parent, &topLeft);
-        RECT rect{topLeft.x, topLeft.y, topLeft.x + panel.preferredSize.cx, topLeft.y + panel.preferredSize.cy};
-        moveFloatingToolPanel(panel, rect);
-        GetWindowRect(panel.hwnd, &panel.dragStartRect);
-    }
-}
-
-void updatePanelDrag(ToolPanel& panel)
-{
-    if (!panel.dragging || !panel.hwnd || !g_parent)
-        return;
-
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    const int dx = cursor.x - panel.dragStartScreen.x;
-    const int dy = cursor.y - panel.dragStartScreen.y;
-    RECT moved = panel.dragStartRect;
-    OffsetRect(&moved, dx, dy);
-
-    POINT topLeft{moved.left, moved.top};
-    POINT bottomRight{moved.right, moved.bottom};
-    ScreenToClient(g_parent, &topLeft);
-    ScreenToClient(g_parent, &bottomRight);
-    RECT clientRect{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
-    moveFloatingToolPanel(panel, clientRect);
-    requestCanvasRender();
-
-    // Present immediately instead of waiting for the next message-loop tick: the
-    // parent's Vulkan surface must redraw the region the panel just vacated before
-    // DWM composites the next frame, or the drag leaves trailing ghost rectangles
-    // behind the panel (an old-school "cascading window" artifact).
-    renderFrame();
-}
-
-void finishPanelDrag(ToolPanel& panel)
-{
-    if (!panel.dragging)
-        return;
-
-    panel.dragging = false;
-    ReleaseCapture();
-    snapToolPanel(panel);
-}
-
-LRESULT CALLBACK ToolPanelProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    ToolPanel* panel = reinterpret_cast<ToolPanel*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-
-    switch (message)
-    {
-    case WM_NCCREATE:
-    {
-        const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-        return TRUE;
-    }
-
-    case WM_LBUTTONDOWN:
-        if (panel && GET_Y_LPARAM(lParam) < kHeaderHeight)
-        {
-            beginPanelDrag(*panel);
-            return 0;
-        }
-        break;
-
-    case WM_MOUSEMOVE:
-        if (panel && panel->dragging)
-        {
-            updatePanelDrag(*panel);
-            return 0;
-        }
-        break;
-
-    case WM_LBUTTONUP:
-    case WM_CAPTURECHANGED:
-        if (panel && panel->dragging)
-        {
-            finishPanelDrag(*panel);
-            return 0;
-        }
-        break;
-
-    case WM_COMMAND:
-        if (handlePanelCommand(wParam, lParam))
-            return 0;
-        break;
-
-    case WM_CTLCOLORSTATIC:
-    {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, RGB(210, 214, 220));
-        SetBkColor(dc, RGB(8, 10, 14));
-        return reinterpret_cast<LRESULT>(g_panelBrush);
-    }
-
-    case WM_CTLCOLOREDIT:
-    {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, RGB(242, 244, 247));
-        SetBkColor(dc, RGB(24, 27, 33));
-        return reinterpret_cast<LRESULT>(g_editBrush);
-    }
-
-    case WM_PAINT:
-        if (panel)
-        {
-            paintPanel(hwnd, *panel);
-            return 0;
-        }
-        break;
-
-    case WM_ERASEBKGND:
-        return 1;
-    }
-
-    return DefWindowProcW(hwnd, message, wParam, lParam);
-}
-
-bool registerPanelClass()
-{
-    if (g_registeredPanelClass)
-        return true;
-
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = ToolPanelProc;
-    windowClass.hInstance = GetModuleHandleW(nullptr);
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.lpszClassName = kPanelClassName;
-    windowClass.hbrBackground = g_panelBrush;
-
-    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-        return false;
-
-    g_registeredPanelClass = true;
-    return true;
-}
-
-void createToolPanel(ToolPanel& panel)
-{
-    RECT rect = panel.floatingRect;
-    DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS;
-    panel.hwnd = CreateWindowExW(
-        WS_EX_CONTROLPARENT,
-        kPanelClassName,
-        L"",
-        style,
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        g_parent,
-        nullptr,
-        GetModuleHandleW(nullptr),
-        &panel);
-
-    if (panel.kind == ToolbarKind::Left && panel.hwnd)
-        createLeftPanelControls(panel.hwnd);
-}
-
-bool handlePanelCommand(WPARAM wParam, LPARAM lParam)
-{
-    const UINT id = LOWORD(wParam);
-    const UINT notification = HIWORD(wParam);
-
-    switch (id)
-    {
-    case IDC_CC_OPEN:
-        if (notification == BN_CLICKED)
-            openCanvasCaliperImageDialog(g_parent);
-        return true;
-    case IDC_CC_USE_PNG:
-        if (notification == BN_CLICKED)
-        {
-            applyPngSpecsToState();
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_RESET_OFFSET:
-        if (notification == BN_CLICKED)
-        {
-            g_state.offsetXIn = 0.0;
-            g_state.offsetYIn = 0.0;
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_FIT_VIEW:
-        if (notification == BN_CLICKED)
-        {
-            g_state.zoomScale = 1.0;
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_ZOOM_OUT:
-        if (notification == BN_CLICKED)
-        {
-            g_state.zoomScale = clampDouble(g_state.zoomScale / kZoomStep, 1.0, kMaxZoom);
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_ZOOM_IN:
-        if (notification == BN_CLICKED)
-        {
-            g_state.zoomScale = clampDouble(g_state.zoomScale * kZoomStep, 1.0, kMaxZoom);
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_CLEAR:
-        if (notification == BN_CLICKED)
-            clearCanvasCaliperImage();
-        return true;
-    case IDC_CC_SAVE:
-        if (notification == BN_CLICKED)
-        {
-            readControlsToState();
-            syncControlsFromState();
-            requestCanvasRender();
-        }
-        return true;
-    case IDC_CC_IMAGE_WIDTH:
-    case IDC_CC_IMAGE_HEIGHT:
-    case IDC_CC_IMAGE_PPI:
-    case IDC_CC_CANVAS_WIDTH:
-    case IDC_CC_CANVAS_HEIGHT:
-    case IDC_CC_GRID_SIZE:
-    case IDC_CC_MAJOR_EVERY:
-    case IDC_CC_OFFSET_X:
-    case IDC_CC_OFFSET_Y:
-    case IDC_CC_ZOOM:
-    case IDC_CC_PALETTE_COUNT:
-        if (notification == EN_CHANGE && lParam != 0 && !g_syncingControls)
-        {
-            readControlsToState();
-            requestCanvasRender();
-            if (g_rightPanel.hwnd)
-                InvalidateRect(g_rightPanel.hwnd, nullptr, FALSE);
-        }
-        return true;
-    default:
-        break;
-    }
-
-    return false;
-}
-
-void loadToolConfig(const nlohmann::json& object, const char* key, ToolPanel& panel)
-{
-    if (!object.contains(key) || !object[key].is_object())
-        return;
-
-    const nlohmann::json& tool = object[key];
-    if (tool.contains("dock") && tool["dock"].is_string())
-        panel.dock = dockFromString(tool["dock"].get<std::string>(), panel.dock);
-
-    const int x = jsonInt(tool, "x", panel.floatingRect.left);
-    const int y = jsonInt(tool, "y", panel.floatingRect.top);
-    panel.floatingRect = {x, y, x + panel.preferredSize.cx, y + panel.preferredSize.cy};
-}
-
-void saveToolConfig(nlohmann::json& object, const char* key, const ToolPanel& panel)
-{
-    object[key] = {
-        {"dock", dockToString(panel.dock)},
-        {"x", panel.floatingRect.left},
-        {"y", panel.floatingRect.top}
-    };
-}
-}
-
+} // namespace
 void loadCanvasCaliperConfig()
 {
     const nlohmann::json empty = nlohmann::json::object();
-    const nlohmann::json& cc = (config.contains("canvasCaliper") && config["canvasCaliper"].is_object()) ? config["canvasCaliper"] : empty;
+    const nlohmann::json &cc =
+        (config.contains("canvasCaliper") && config["canvasCaliper"].is_object()) ? config["canvasCaliper"] : empty;
 
-    g_state.imageWidthIn = clampDouble(jsonDouble(cc, "imageWidthIn", g_state.imageWidthIn), 0.01, 10000.0);
-    g_state.imageHeightIn = clampDouble(jsonDouble(cc, "imageHeightIn", g_state.imageHeightIn), 0.01, 10000.0);
+    g_state.imageWidthIn = clampDouble(jsonDouble(cc, "imageWidthIn", g_state.imageWidthIn), 0.0002, 16384.0);
+    g_state.imageHeightIn = clampDouble(jsonDouble(cc, "imageHeightIn", g_state.imageHeightIn), 0.0002, 16384.0);
     g_state.imagePpi = clampDouble(jsonDouble(cc, "imagePpi", g_state.imagePpi), 1.0, 5000.0);
-    g_state.canvasWidthIn = clampDouble(jsonDouble(cc, "canvasWidthIn", g_state.canvasWidthIn), 0.01, 10000.0);
-    g_state.canvasHeightIn = clampDouble(jsonDouble(cc, "canvasHeightIn", g_state.canvasHeightIn), 0.01, 10000.0);
-    g_state.gridSizeIn = clampDouble(jsonDouble(cc, "gridSizeIn", g_state.gridSizeIn), 0.01, 10000.0);
-    g_state.offsetXIn = snapQuarter(jsonDouble(cc, "offsetXIn", g_state.offsetXIn));
-    g_state.offsetYIn = snapQuarter(jsonDouble(cc, "offsetYIn", g_state.offsetYIn));
+    g_state.canvasWidthIn = clampDouble(jsonDouble(cc, "canvasWidthIn", g_state.canvasWidthIn), 0.0002, 16384.0);
+    g_state.canvasHeightIn = clampDouble(jsonDouble(cc, "canvasHeightIn", g_state.canvasHeightIn), 0.0002, 16384.0);
+    g_state.gridSizeIn = clampDouble(jsonDouble(cc, "gridSizeIn", g_state.gridSizeIn), 0.000001, 10000.0);
+    g_state.offsetXIn = clampDouble(jsonDouble(cc, "offsetXIn", g_state.offsetXIn), -10000, 10000);
+    g_state.offsetYIn = clampDouble(jsonDouble(cc, "offsetYIn", g_state.offsetYIn), -10000, 10000);
     g_state.zoomScale = clampDouble(jsonDouble(cc, "zoomScale", g_state.zoomScale), 1.0, kMaxZoom);
     g_state.majorEvery = std::clamp(jsonInt(cc, "majorEvery", g_state.majorEvery), 0, 10000);
     g_state.paletteCount = std::clamp(jsonInt(cc, "paletteCount", g_state.paletteCount), 8, 64);
+    g_state.gridSizeIn = std::max(g_state.gridSizeIn, 1.0 / g_state.imagePpi);
     g_state.showGrid = jsonBool(cc, "showGrid", g_state.showGrid);
     g_state.showRulers = jsonBool(cc, "showRulers", g_state.showRulers);
+    g_state.showLines = jsonBool(cc, "showLines", true);
 
-    loadToolConfig(cc, "leftToolbar", g_leftPanel);
-    loadToolConfig(cc, "rightToolbar", g_rightPanel);
+    g_rulerUnits = std::clamp(jsonInt(cc, "rulerUnits", 0), 0, 2);
 }
 
 void saveCanvasCaliperConfig()
 {
-    nlohmann::json cc = {
-        {"imageWidthIn", g_state.imageWidthIn},
-        {"imageHeightIn", g_state.imageHeightIn},
-        {"imagePpi", g_state.imagePpi},
-        {"canvasWidthIn", g_state.canvasWidthIn},
-        {"canvasHeightIn", g_state.canvasHeightIn},
-        {"gridSizeIn", g_state.gridSizeIn},
-        {"majorEvery", g_state.majorEvery},
-        {"offsetXIn", g_state.offsetXIn},
-        {"offsetYIn", g_state.offsetYIn},
-        {"zoomScale", g_state.zoomScale},
-        {"paletteCount", g_state.paletteCount},
-        {"showGrid", g_state.showGrid},
-        {"showRulers", g_state.showRulers}
-    };
-    saveToolConfig(cc, "leftToolbar", g_leftPanel);
-    saveToolConfig(cc, "rightToolbar", g_rightPanel);
+    nlohmann::json cc = {{"imageWidthIn", g_state.imageWidthIn},
+                         {"imageHeightIn", g_state.imageHeightIn},
+                         {"imagePpi", g_state.imagePpi},
+                         {"canvasWidthIn", g_state.canvasWidthIn},
+                         {"canvasHeightIn", g_state.canvasHeightIn},
+                         {"gridSizeIn", g_state.gridSizeIn},
+                         {"majorEvery", g_state.majorEvery},
+                         {"offsetXIn", g_state.offsetXIn},
+                         {"offsetYIn", g_state.offsetYIn},
+                         {"zoomScale", g_state.zoomScale},
+                         {"paletteCount", g_state.paletteCount},
+                         {"showGrid", g_state.showGrid},
+                         {"showRulers", g_state.showRulers}};
+    cc["rulerUnits"] = g_rulerUnits;
+    cc["showLines"] = g_state.showLines;
     config["canvasCaliper"] = cc;
 }
 
 void initializeCanvasCaliper(HWND hwnd)
 {
     g_parent = hwnd;
+    g_shutdown = false;
     loadCanvasCaliperConfig();
-
-    g_uiFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    g_panelBrush = CreateSolidBrush(RGB(8, 10, 14));
-    g_editBrush = CreateSolidBrush(RGB(24, 27, 33));
-
-    if (!registerPanelClass())
-        return;
-
-    createToolPanel(g_leftPanel);
-    createToolPanel(g_rightPanel);
     DragAcceptFiles(hwnd, TRUE);
     layoutCanvasCaliperChrome();
-    syncControlsFromState();
-    requestCanvasRender();
+    const auto last = lastOpenFile();
+    if (!last.empty())
+        loadCanvasCaliperImagePath(hwnd, last.c_str(), true);
+    else
+        newCanvasCaliperImage();
 }
-
 void shutdownCanvasCaliper()
 {
-    DragAcceptFiles(g_parent, FALSE);
-    clearVulkanCanvasImage();
+    g_shutdown = true;
+    g_history.clear();
+    if (g_openCancel)
+        g_openCancel->store(true);
+    waitForCpuWork();
+    {
+        std::lock_guard lock(g_completionMutex);
+        g_completions.clear();
+    }
 
-    if (g_leftPanel.hwnd)
-        DestroyWindow(g_leftPanel.hwnd);
-    if (g_rightPanel.hwnd)
-        DestroyWindow(g_rightPanel.hwnd);
-
-    g_leftPanel.hwnd = nullptr;
-    g_rightPanel.hwnd = nullptr;
+    if (g_parent && IsWindow(g_parent))
+        DragAcceptFiles(g_parent, FALSE);
     g_parent = nullptr;
-
-    if (g_panelBrush)
-    {
-        DeleteObject(g_panelBrush);
-        g_panelBrush = nullptr;
-    }
-    if (g_editBrush)
-    {
-        DeleteObject(g_editBrush);
-        g_editBrush = nullptr;
-    }
 }
-
 void layoutCanvasCaliperChrome()
 {
-    if (!g_parent)
-        return;
-
     RECT client{};
-    GetClientRect(g_parent, &client);
-    const int clientWidth = client.right - client.left;
-    const int clientHeight = client.bottom - client.top;
-
-    const int panelAreaHeight = std::max(0, clientHeight - kTopToolbarHeight);
-
-    auto layoutPanel = [&](ToolPanel& panel) {
-        if (!panel.hwnd)
-            return;
-
-        if (panel.dock == ToolbarDock::Left)
-        {
-            MoveWindow(panel.hwnd, 0, kTopToolbarHeight, panel.preferredSize.cx, panelAreaHeight, TRUE);
-        }
-        else if (panel.dock == ToolbarDock::Right)
-        {
-            MoveWindow(panel.hwnd, clientWidth - panel.preferredSize.cx, kTopToolbarHeight, panel.preferredSize.cx, panelAreaHeight, TRUE);
-        }
-        else
-        {
-            RECT rect = panel.floatingRect;
-            const int width = rect.right - rect.left;
-            const int height = rect.bottom - rect.top;
-            rect.left = std::clamp<LONG>(rect.left, 0, std::max<LONG>(0, clientWidth - width));
-            rect.top = std::clamp<LONG>(rect.top, kTopToolbarHeight, std::max<LONG>(kTopToolbarHeight, clientHeight - height));
-            rect.right = rect.left + width;
-            rect.bottom = rect.top + height;
-            panel.floatingRect = rect;
-            MoveWindow(panel.hwnd, rect.left, rect.top, width, height, TRUE);
-        }
+    if (!g_parent || !GetClientRect(g_parent, &client))
+        return;
+    g_uiScale = std::max(1.0, std::min({double(GetDpiForWindow(g_parent)) / 96.0, double(client.right) / 1280.0,
+                                        double(client.bottom) / 720.0}));
+    g_surfaceWidth = client.right;
+    g_surfaceHeight = client.bottom;
+    g_layout = computeLayout(client.right, client.bottom);
+}
+bool loadCanvasCaliperImagePath(HWND owner, const wchar_t *filename, bool restore)
+{
+    if (!filename || !*filename)
+        return false;
+    if (g_openCancel)
+        g_openCancel->store(true);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    g_openCancel = cancel;
+    const std::filesystem::path path(filename);
+    const auto ticket = ++g_openTicket;
+    const double fallbackPpi = g_state.imagePpi;
+    const auto gpuLimit = vulkanDeviceProperties().limits.maxImageDimension2D;
+    struct Loaded
+    {
+        SimpDocument document;
+        DecodedImage image;
+        std::vector<PaletteColor> colors;
+        PngPhysicalInfo physical;
+        bool native = false, canceled = false;
     };
-
-    layoutPanel(g_leftPanel);
-    layoutPanel(g_rightPanel);
-    g_layout = computeLayout(static_cast<std::uint32_t>(clientWidth), static_cast<std::uint32_t>(clientHeight));
-}
-
-void openCanvasCaliperImageDialog(HWND owner)
-{
-    wchar_t filename[MAX_PATH] = {};
-    OPENFILENAMEW open{};
-    open.lStructSize = sizeof(open);
-    open.hwndOwner = owner;
-    open.lpstrFilter =
-        L"All Supported Images (*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gif;*.psd;*.hdr;*.pic;*.pnm;*.ppm;*.pgm)\0"
-        L"*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gif;*.psd;*.hdr;*.pic;*.pnm;*.ppm;*.pgm\0"
-        L"All Files (*.*)\0*.*\0";
-    open.lpstrFile = filename;
-    open.nMaxFile = static_cast<DWORD>(std::size(filename));
-    open.lpstrTitle = L"Open Image";
-    open.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    open.lpstrDefExt = L"png";
-
-    if (GetOpenFileNameW(&open))
-        loadCanvasCaliperImagePath(owner, filename);
-}
-
-bool loadCanvasCaliperImagePath(HWND owner, const wchar_t* path)
-{
-    if (!path || !*path)
-        return false;
-
-    const std::filesystem::path imagePath(path);
-    if (!isSupportedImagePath(imagePath))
-    {
-        MessageBoxW(owner, L"Please choose a supported image file (PNG, JPEG, BMP, TGA, GIF, PSD, HDR, PIC, or PNM).", L"SIMP", MB_OK | MB_ICONWARNING);
-        return false;
-    }
-
-    DecodedImage decoded;
-    if (!decodeImageFileBGRA(imagePath, decoded))
-    {
-        MessageBoxW(owner, L"Could not decode that image.", L"SIMP", MB_OK | MB_ICONERROR);
-        return false;
-    }
-
-    g_state.image = std::move(decoded);
-    g_state.hasImage = true;
-    g_state.imagePath = imagePath.wstring();
-    g_state.imageName = filenameOnly(imagePath);
-
-    const PngPhysicalInfo physical = parsePngPhysicalInfo(imagePath);
-    if (physical.found)
-    {
-        g_state.detectedPpi = (physical.ppiX + physical.ppiY) * 0.5;
-        wchar_t source[96] = {};
-        std::swprintf(source, std::size(source), L"PNG pHYs %.2f x %.2f", physical.ppiX, physical.ppiY);
-        g_state.ppiSource = source;
-    }
-    else
-    {
-        g_state.detectedPpi = g_state.imagePpi;
-        g_state.ppiSource = L"manual";
-    }
-
-    applyPngSpecsToState();
-    computePalette();
-    setVulkanCanvasImage(g_state.image);
-    syncControlsFromState();
-    requestCanvasRender();
+    startCpuJob(
+        L"Opening image...",
+        [path, cancel, fallbackPpi, gpuLimit] {
+            Loaded loaded;
+            if (cancel->load())
+            {
+                loaded.canceled = true;
+                return loaded;
+            }
+            std::ifstream input(path, std::ios::binary);
+            char magic[4]{};
+            input.read(magic, 4);
+            loaded.native = input && !std::memcmp(magic, "SIMP", 4);
+            input.close();
+            if (loaded.native)
+            {
+                if (!loadSimpDocument(path, loaded.document))
+                    throw std::runtime_error("Could not read this SIMP document.");
+                if (loaded.document.hasCels)
+                {
+                    loaded.image.width = loaded.document.stack.image().width;
+                    loaded.image.height = loaded.document.stack.image().height;
+                    loaded.document.layerImage = {}; // Compatibility preview isn't editable storage.
+                }
+                else
+                    loaded.image = std::move(loaded.document.layerImage);
+            }
+            else
+            {
+                if (!decodeImageFileBGRA(path, loaded.image))
+                    throw std::runtime_error("Could not decode this image.");
+                loaded.physical = parsePngPhysicalInfo(path);
+                loaded.document.layerPpi =
+                    loaded.physical.found ? (loaded.physical.ppiX + loaded.physical.ppiY) * 0.5 : fallbackPpi;
+            }
+            if (loaded.image.width > gpuLimit || loaded.image.height > gpuLimit)
+                throw std::runtime_error("This image exceeds the selected GPU texture limit.");
+            if (cancel->load())
+            {
+                loaded.canceled = true;
+                return loaded;
+            }
+            loaded.colors =
+                loaded.document.hasCels ? collectCelColors(loaded.document.stack) : collectImageColors(loaded.image);
+            return loaded;
+        },
+        [owner, path, ticket](Loaded loaded) {
+            if (loaded.canceled || ticket != g_openTicket || !confirmCanvasCaliperClose(owner) ||
+                ticket != g_openTicket)
+                return;
+            resetEditingSession();
+            g_hasDirtyPixels = false;
+            if (loaded.document.hasCels)
+                static_cast<CelStack &>(g_state) = std::move(loaded.document.stack);
+            else
+                g_state.image() = std::move(loaded.image);
+            for (const auto &cel : g_state.cels)
+                g_nextCelId = std::max(g_nextCelId, cel.id + 1);
+            g_state.hasImage = !g_state.image().pixels.empty();
+            g_state.imageName = path.filename().wstring();
+            g_state.imagePath = loaded.native ? L"" : path.wstring();
+            g_state.imagePpi = g_state.detectedPpi = clampDouble(loaded.document.layerPpi, 1, 5000);
+            g_state.ppiSource = loaded.native ? L"document" : (loaded.physical.found ? L"PNG pHYs" : L"manual");
+            g_state.offsetXIn = loaded.native ? loaded.document.layerOffsetXIn : 0;
+            g_state.offsetYIn = loaded.native ? loaded.document.layerOffsetYIn : 0;
+            if (loaded.native)
+            {
+                const auto &d = loaded.document;
+                g_state.canvasWidthIn = d.canvasWidthIn;
+                g_state.canvasHeightIn = d.canvasHeightIn;
+                g_state.gridSizeIn = d.gridSizeIn;
+                g_state.majorEvery = d.majorEvery;
+                g_state.showGrid = d.showGrid;
+                g_state.showRulers = d.showRulers;
+                g_state.showLines = d.showLines;
+                g_rulerUnits = d.rulerUnits;
+                g_state.lines = std::move(loaded.document.lines);
+                g_documentPath = path;
+            }
+            applyPngSpecsToState();
+            if (!loaded.native)
+            {
+                g_state.canvasWidthIn = g_state.imageWidthIn;
+                g_state.canvasHeightIn = g_state.imageHeightIn;
+            }
+            if (!g_state.hasImage)
+            {
+                g_state.imageWidthIn = g_state.canvasWidthIn;
+                g_state.imageHeightIn = g_state.canvasHeightIn;
+            }
+            g_panX = g_panY = 0;
+            g_state.zoomScale = 1;
+            g_state.palette = std::move(loaded.colors);
+            g_state.paletteUpdating = false;
+            if (g_state.hasImage)
+                setVulkanCels(g_state);
+            else
+                clearVulkanCanvasImage();
+            rememberOpenFile(path);
+            requestCanvasRender();
+        },
+        [restore, ticket] {
+            if (restore && ticket == g_openTicket)
+            {
+                config["lastOpenFile"] = "";
+                newCanvasCaliperImage();
+            }
+        });
     return true;
 }
 
-void clearCanvasCaliperImage()
+namespace
 {
-    g_state.hasImage = false;
-    g_state.image = {};
-    g_state.imagePath.clear();
-    g_state.imageName.clear();
-    g_state.detectedPpi = g_state.imagePpi;
-    g_state.ppiSource = L"manual";
-    g_state.palette.clear();
-    g_state.probeValid = false;
-    g_state.probeText = L"Move over image";
-    clearVulkanCanvasImage();
-    syncControlsFromState();
-    requestCanvasRender();
+void createCanvasAsync(std::uint32_t width, std::uint32_t height, double ppi)
+{
+    if (g_openCancel)
+        g_openCancel->store(true);
+    const auto ticket = ++g_openTicket, revision = g_revision;
+    startCpuJob(
+        L"Creating canvas...",
+        [width, height] {
+            DecodedImage image{width, height, {}};
+            image.pixels.assign(std::size_t(width) * height * 4, 255);
+            return image;
+        },
+        [width, height, ppi, ticket, revision](DecodedImage image) {
+            if (ticket != g_openTicket || (revision != g_revision && !confirmCanvasCaliperClose(g_parent)) ||
+                ticket != g_openTicket)
+                return;
+            resetEditingSession();
+            g_hasDirtyPixels = false;
+            g_state.image() = std::move(image);
+            g_state.hasImage = true;
+            g_panX = g_panY = 0;
+            g_state.zoomScale = 1;
+            g_state.imagePath.clear();
+            g_state.imageName = L"Untitled";
+            g_state.imagePpi = g_state.detectedPpi = ppi;
+            g_state.ppiSource = L"new canvas";
+            g_state.imageWidthIn = g_state.canvasWidthIn = double(width) / ppi;
+            g_state.imageHeightIn = g_state.canvasHeightIn = double(height) / ppi;
+            g_state.offsetXIn = g_state.offsetYIn = 0;
+            g_state.gridSizeIn = std::max(g_state.gridSizeIn, 1 / ppi);
+            g_state.palette = {{255, 255, 255}};
+            g_state.paletteUpdating = false;
+            g_state.paintColor = {0, 0, 0};
+            setVulkanCels(g_state);
+            requestCanvasRender();
+        });
+}
+} // namespace
+void newCanvasCaliperImage()
+{
+    const double w = std::round(g_state.canvasWidthIn * g_state.imagePpi),
+                 h = std::round(g_state.canvasHeightIn * g_state.imagePpi);
+    const auto limit = std::min<std::uint32_t>(16384, vulkanDeviceProperties().limits.maxImageDimension2D);
+    if (w < 1 || h < 1 || w > limit || h > limit || w * h > 64000000)
+    {
+        MessageBoxW(g_parent, L"Canvas dimensions exceed the image or GPU limit.", L"SIMP", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    createCanvasAsync(std::uint32_t(w), std::uint32_t(h), g_state.imagePpi);
+}
+
+void flushCanvasCaliperEdits()
+{
+    if (!g_hasDirtyPixels || !g_state.hasImage)
+        return;
+    updateVulkanCanvasRegion(g_state.image(), static_cast<std::uint32_t>(g_dirtyPixels.left),
+                             static_cast<std::uint32_t>(g_dirtyPixels.top),
+                             static_cast<std::uint32_t>(g_dirtyPixels.right - g_dirtyPixels.left),
+                             static_cast<std::uint32_t>(g_dirtyPixels.bottom - g_dirtyPixels.top));
+    g_hasDirtyPixels = false;
 }
 
 void openCanvasCaliperDocumentDialog(HWND owner)
 {
-    wchar_t filename[MAX_PATH] = {};
+    std::array<wchar_t, 32768> filename{};
     OPENFILENAMEW open{};
     open.lStructSize = sizeof(open);
     open.hwndOwner = owner;
-    open.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0All Files (*.*)\0*.*\0";
-    open.lpstrFile = filename;
-    open.nMaxFile = static_cast<DWORD>(std::size(filename));
-    open.lpstrTitle = L"Open SIMP Document";
-    open.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    open.lpstrDefExt = L"simp";
-
-    if (!GetOpenFileNameW(&open))
-        return;
-
-    SimpDocument document;
-    if (!loadSimpDocument(filename, document))
-    {
-        MessageBoxW(owner, L"Could not read that SIMP document.", L"SIMP", MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    g_state.canvasWidthIn = clampDouble(document.canvasWidthIn, 0.01, 10000.0);
-    g_state.canvasHeightIn = clampDouble(document.canvasHeightIn, 0.01, 10000.0);
-    g_state.gridSizeIn = clampDouble(document.gridSizeIn, 0.01, 10000.0);
-    g_state.majorEvery = std::clamp(document.majorEvery, 0, 10000);
-    g_state.paletteCount = std::clamp(document.paletteCount, 8, 64);
-    g_state.showGrid = document.showGrid;
-    g_state.showRulers = document.showRulers;
-
-    if (document.hasLayer)
-    {
-        g_state.image = std::move(document.layerImage);
-        g_state.hasImage = true;
-        g_state.imagePath.clear();
-        g_state.imageName = document.layerName;
-        g_state.imagePpi = clampDouble(document.layerPpi, 1.0, 5000.0);
-        g_state.detectedPpi = g_state.imagePpi;
-        g_state.ppiSource = L"document";
-        g_state.offsetXIn = snapQuarter(document.layerOffsetXIn);
-        g_state.offsetYIn = snapQuarter(document.layerOffsetYIn);
-        applyPngSpecsToState();
-        computePalette();
-        setVulkanCanvasImage(g_state.image);
-        syncControlsFromState();
-        requestCanvasRender();
-    }
-    else
-    {
-        clearCanvasCaliperImage();
-    }
+    open.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0"
+                       L"PNG Images (*.png)\0*.png\0"
+                       L"JPEG Images (*.jpg; *.jpeg)\0*.jpg;*.jpeg\0"
+                       L"Windows Bitmaps (*.bmp)\0*.bmp\0"
+                       L"Targa Images (*.tga)\0*.tga\0"
+                       L"GIF Images (*.gif)\0*.gif\0"
+                       L"Photoshop Images (*.psd)\0*.psd\0"
+                       L"Radiance HDR Images (*.hdr)\0*.hdr\0"
+                       L"Softimage Images (*.pic)\0*.pic\0"
+                       L"Portable Anymap Images (*.pnm)\0*.pnm\0"
+                       L"Portable Pixmap Images (*.ppm)\0*.ppm\0"
+                       L"Portable Graymap Images (*.pgm)\0*.pgm\0"
+                       L"All Files (*.*)\0*.*\0";
+    open.lpstrFile = filename.data();
+    open.nMaxFile = DWORD(filename.size());
+    open.lpstrTitle = L"Open";
+    open.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&open))
+        loadCanvasCaliperImagePath(owner, filename.data());
 }
 
-void saveCanvasCaliperDocumentAsDialog(HWND owner)
+namespace
 {
-    wchar_t filename[MAX_PATH] = {};
-    OPENFILENAMEW save{};
-    save.lStructSize = sizeof(save);
-    save.hwndOwner = owner;
-    save.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0All Files (*.*)\0*.*\0";
-    save.lpstrFile = filename;
-    save.nMaxFile = static_cast<DWORD>(std::size(filename));
-    save.lpstrTitle = L"Save SIMP Document As";
-    save.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    save.lpstrDefExt = L"simp";
-
-    if (!GetSaveFileNameW(&save))
-        return;
-
+bool writeCanvasDocument(HWND owner, const std::filesystem::path &path)
+{
+    if (g_saving)
+    {
+        g_saveAgain = true;
+        g_queuedSavePath = path;
+        g_queuedSaveEpoch = g_epoch;
+        return true;
+    }
     SimpDocument document;
     document.canvasWidthIn = g_state.canvasWidthIn;
     document.canvasHeightIn = g_state.canvasHeightIn;
@@ -1800,32 +1089,175 @@ void saveCanvasCaliperDocumentAsDialog(HWND owner)
     document.paletteCount = g_state.paletteCount;
     document.showGrid = g_state.showGrid;
     document.showRulers = g_state.showRulers;
-
+    document.rulerUnits = g_rulerUnits;
+    document.lines = g_state.lines;
+    document.showLines = g_state.showLines;
     if (g_state.hasImage)
     {
         document.hasLayer = true;
         document.layerOffsetXIn = g_state.offsetXIn;
         document.layerOffsetYIn = g_state.offsetYIn;
         document.layerPpi = g_state.imagePpi;
-        document.layerName = g_state.imageName;
-        document.layerImage = g_state.image;
+        document.layerName = path.filename().wstring();
+        document.hasCels = true;
+        document.stack = g_state;
     }
-
-    if (!saveSimpDocument(filename, document))
-        MessageBoxW(owner, L"Could not save that SIMP document.", L"SIMP", MB_OK | MB_ICONERROR);
+    const auto epoch = g_epoch, revision = g_revision;
+    g_saving = true;
+    g_savingPath = path;
+    g_savingEpoch = epoch;
+    startCpuJob(
+        L"Saving document...", [document = std::move(document), path] { return saveSimpDocument(path, document); },
+        [owner, path, epoch, revision](bool success) {
+            g_saving = false;
+            if (!success)
+                MessageBoxW(owner, L"Could not save the document. The previous file was preserved.", L"SIMP",
+                            MB_OK | MB_ICONERROR);
+            else if (epoch == g_epoch)
+            {
+                g_documentPath = path;
+                g_state.imageName = path.filename().wstring();
+                rememberOpenFile(path);
+                if (revision == g_revision)
+                    g_documentModified = false;
+                requestCanvasRender();
+            }
+            if (g_saveAgain)
+            {
+                g_saveAgain = false;
+                if (g_queuedSaveEpoch == g_epoch)
+                    writeCanvasDocument(owner, g_queuedSavePath);
+            }
+        },
+        [] {
+            g_saving = false;
+            g_saveAgain = false;
+        });
+    return true;
 }
-
-bool handleCanvasCaliperCommand(HWND hwnd, WPARAM wParam, LPARAM lParam)
+} // namespace
+void saveCanvasCaliperDocumentAsDialog(HWND owner)
 {
-    return handlePanelCommand(wParam, lParam);
+    std::array<wchar_t, 32768> filename{};
+    auto initial = g_documentPath.empty() ? std::filesystem::path(g_state.imageName) : g_documentPath;
+    if (initial.empty())
+        initial = L"Untitled";
+    initial.replace_extension(L".simp");
+    wcsncpy_s(filename.data(), filename.size(), initial.c_str(), _TRUNCATE);
+    OPENFILENAMEW save{};
+    save.lStructSize = sizeof(save);
+    save.hwndOwner = owner;
+    save.lpstrFilter = L"SIMP Documents (*.simp)\0*.simp\0All Files (*.*)\0*.*\0";
+    save.lpstrFile = filename.data();
+    save.nMaxFile = DWORD(filename.size());
+    save.lpstrTitle = L"Save As";
+    save.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    save.lpstrDefExt = L"simp";
+    if (GetSaveFileNameW(&save))
+        writeCanvasDocument(owner, filename.data());
+}
+void saveCanvasCaliperDocument(HWND owner)
+{
+    if (g_saving && g_savingEpoch == g_epoch)
+        writeCanvasDocument(owner, g_savingPath);
+    else if (g_documentPath.empty())
+        saveCanvasCaliperDocumentAsDialog(owner);
+    else
+        writeCanvasDocument(owner, g_documentPath);
+}
+void editCanvasCaliperHistory(HWND owner, bool redo)
+{
+    if (g_drag.painting)
+    {
+        g_drag.painting = false;
+        g_history.commit();
+        if (GetCapture() == owner)
+            ReleaseCapture();
+    }
+    flushCanvasCaliperEdits();
+    if (redo ? g_history.redo(static_cast<CelStack &>(g_state), g_state.lines)
+             : g_history.undo(static_cast<CelStack &>(g_state), g_state.lines))
+    {
+        const auto r = g_history.lastRegion();
+        if (g_history.stackChanged())
+        {
+            ++g_pixelsRevision;
+            setVulkanCels(g_state);
+            schedulePalette();
+        }
+        else if (r.right > r.left && r.bottom > r.top)
+        {
+            if (g_history.celsChanged())
+                selectVulkanCel(g_state.activeCel);
+            markDirtyPixels(r.left, r.top, r.right, r.bottom);
+            schedulePalette();
+        }
+        if (g_history.celsChanged())
+            revealActiveCel();
+        markDocumentModified();
+        g_dragLine = -1;
+        requestCanvasRender();
+    }
+    else if (!g_history.error().empty())
+        MessageBoxA(owner, g_history.error().c_str(), "SIMP Undo", MB_OK | MB_ICONERROR);
 }
 
-bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
+void toggleCanvasView(HWND owner, UINT command)
+{
+    switch (command)
+    {
+    case IDM_VIEW_GRID:
+        g_state.showGrid = !g_state.showGrid;
+        break;
+    case IDM_VIEW_RULERS:
+        g_state.showRulers = !g_state.showRulers;
+        break;
+    case IDM_VIEW_LINES:
+        g_state.showLines = !g_state.showLines;
+        break;
+    }
+    updateCanvasCaliperMenu(GetMenu(owner));
+    DrawMenuBar(owner);
+    requestCanvasRender();
+}
+bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT &result)
 {
     switch (message)
     {
-    case WM_DROPFILES:
-    {
+    case kCpuReadyMessage:
+        result = 0;
+        return true;
+    case WM_MOUSELEAVE:
+        g_trackingMouse = false;
+        if (std::exchange(g_state.probeValid, false))
+            requestRender();
+        if (g_dragLine < 0 && g_lineOptions < 0 && g_state.highlightedLine != -1)
+        {
+            g_state.highlightedLine = -1;
+            requestRender();
+        }
+        result = 0;
+        return true;
+    case WM_SETCURSOR: {
+        if (g_dragLine >= 0 && std::size_t(g_dragLine) < g_state.lines.size())
+        {
+            SetCursor(LoadCursorW(nullptr, g_state.lines[g_dragLine].vertical ? IDC_SIZEWE : IDC_SIZENS));
+            result = TRUE;
+            return true;
+        }
+        POINT p{};
+        GetCursorPos(&p);
+        ScreenToClient(hwnd, &p);
+        const int axis = rulerAxis(g_layout, g_surfaceWidth, g_surfaceHeight, g_uiScale, g_state.showRulers, p.x, p.y);
+        if (axis >= 0 && hitGuide(g_state, g_layout, axis, axis == 0 ? p.x : p.y, ui(12)) >= 0)
+        {
+            SetCursor(LoadCursorW(nullptr, axis == 0 ? IDC_SIZEWE : IDC_SIZENS));
+            result = TRUE;
+            return true;
+        }
+        break;
+    }
+    case WM_DROPFILES: {
         HDROP drop = reinterpret_cast<HDROP>(wParam);
         wchar_t path[MAX_PATH] = {};
         if (DragQueryFileW(drop, 0, path, static_cast<UINT>(std::size(path))))
@@ -1835,34 +1267,239 @@ bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
         return true;
     }
 
-    case WM_MOUSEMOVE:
-    {
+    case WM_MOUSEMOVE: {
+        setSecondaryActive((GetKeyState(VK_MENU) & 0x8000) != 0);
         const int x = GET_X_LPARAM(lParam);
         const int y = GET_Y_LPARAM(lParam);
+        if (!g_trackingMouse)
+        {
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tracking);
+            g_trackingMouse = true;
+        }
+        updateGuideHighlight(x, y);
+        if (g_dragCels)
+        {
+            const auto list = layoutCels(g_surfaceWidth, g_surfaceHeight, g_uiScale);
+            const auto maximum = g_state.cels.size() > std::size_t(list.rows) ? g_state.cels.size() - list.rows : 0;
+            const double at =
+                std::clamp(double(y - list.track.top) / std::max(1, list.track.bottom - list.track.top), 0.0, 1.0);
+            g_state.celOffset = std::size_t(at * maximum);
+            requestRender();
+            result = 0;
+            return true;
+        }
+        if (g_dragPalette)
+        {
+            scrollPaletteTo(y);
+            result = 0;
+            return true;
+        }
+        if (g_dragLine >= 0 && std::size_t(g_dragLine) < g_state.lines.size())
+        {
+            if (wParam & MK_LBUTTON)
+                moveDraggedLine(x, y);
+            SetCursor(LoadCursorW(nullptr, g_state.lines[g_dragLine].vertical ? IDC_SIZEWE : IDC_SIZENS));
+            result = 0;
+            return true;
+        }
+        if (g_drag.painting)
+            advanceStrokeAt(x, y);
         if (g_drag.panning)
         {
-            const double dxIn = (static_cast<double>(x - g_drag.startPoint.x)) / std::max(1.0, g_layout.pxPerIn);
-            const double dyIn = (static_cast<double>(y - g_drag.startPoint.y)) / std::max(1.0, g_layout.pxPerIn);
-            g_state.offsetXIn = snapQuarter(g_drag.startOffsetXIn + dxIn);
-            g_state.offsetYIn = snapQuarter(g_drag.startOffsetYIn + dyIn);
-            syncControlsFromState();
+            g_panX = g_drag.startOffsetXIn + x - g_drag.startPoint.x;
+            g_panY = g_drag.startOffsetYIn + y - g_drag.startPoint.y;
             requestCanvasRender();
         }
-        updateCursorSummary(x, y);
         updateProbe(x, y);
         break;
     }
 
-    case WM_RBUTTONDOWN:
-    {
+    case WM_LBUTTONDOWN: {
+        setSecondaryActive((GetKeyState(VK_MENU) & 0x8000) != 0);
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int axis =
+            rulerAxis(g_layout, g_surfaceWidth, g_surfaceHeight, g_uiScale, g_state.showRulers, point.x, point.y);
+        if (axis >= 0)
+        {
+            g_history.commit();
+            g_dragLine = hitGuide(g_state, g_layout, axis, axis == 0 ? point.x : point.y, ui(12));
+            if (g_dragLine >= 0)
+            {
+                g_state.highlightedLine = g_dragLine;
+                SetCapture(hwnd);
+                requestRender();
+            }
+            result = 0;
+            return true;
+        }
+        for (const auto &hit : g_uiHits)
+            if (hit.rect.contains(point.x, point.y))
+            {
+                const int action = hit.action;
+                if ((action >= UI_CEL_SELECT_FIRST && action < UI_CEL_SELECT_FIRST + int(kMaxCels)) ||
+                    (action >= UI_CEL_VISIBLE_FIRST && action < UI_CEL_VISIBLE_FIRST + int(kMaxCels)) ||
+                    (action >= UI_CEL_NEW && action <= UI_CEL_SCROLL))
+                    handleCelAction(hwnd, action);
+                else if (action >= UI_PALETTE_FIRST)
+                {
+                    const auto index = std::size_t(action - UI_PALETTE_FIRST);
+                    if (index < g_state.palette.size())
+                        editingPaintColor() = g_state.palette[index];
+                }
+                else if (action == UI_PALETTE_SCROLL)
+                {
+                    g_dragPalette = true;
+                    SetCapture(hwnd);
+                    scrollPaletteTo(point.y);
+                }
+                else if (action == UI_ORIGINAL)
+                {
+                    g_state.zoomScale = originalZoomScale(g_state, g_layout);
+                    g_panX = g_panY = 0;
+                    const auto l = computeLayout(g_surfaceWidth, g_surfaceHeight);
+                    const auto area = workspaceRect();
+                    g_panX = std::floor((double(area.left) + area.right - g_state.image().width) / 2) -
+                             (l.originX + g_state.offsetXIn * l.pxPerIn);
+                    g_panY = std::floor((double(area.top) + area.bottom - g_state.image().height) / 2) -
+                             (l.originY + g_state.offsetYIn * l.pxPerIn);
+                }
+                else if (action == UI_ZOOM_OUT)
+                    zoomCanvas(1 / kZoomStep, (workspaceRect().left + workspaceRect().right) / 2,
+                               (workspaceRect().top + workspaceRect().bottom) / 2);
+                else if (action == UI_ZOOM_IN)
+                    zoomCanvas(kZoomStep, (workspaceRect().left + workspaceRect().right) / 2,
+                               (workspaceRect().top + workspaceRect().bottom) / 2);
+                else if (action == UI_FIT)
+                {
+                    g_state.zoomScale = 1;
+                    g_panX = g_panY = 0;
+                }
+                else if (action == UI_BRUSH)
+                    selectPaintTool(PaintTool::Brush);
+                else if (action == UI_CELL)
+                    selectPaintTool(PaintTool::Cell);
+                else if (action == UI_PICKER)
+                    selectPaintTool(PaintTool::Pick);
+                else if (action == UI_COLOR || action == UI_SECONDARY_COLOR)
+                {
+                    choosePaintColor(hwnd, action == UI_SECONDARY_COLOR || g_state.secondaryActive);
+                }
+                else
+                    PostMessageW(hwnd, WM_COMMAND, action, 0);
+                requestCanvasRender();
+                result = 0;
+                return true;
+            }
+        if (g_state.tool == PaintTool::Pick && pointInsideImage(point.x, point.y))
+        {
+            updateProbe(point.x, point.y);
+            if (g_state.probeValid)
+                editingPaintColor() = g_state.probeColor;
+            requestRender();
+            result = 0;
+            return true;
+        }
+        int cellX = 0;
+        int cellY = 0;
+        if (!g_drag.panning && pointToPaintPosition(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), cellX, cellY))
+        {
+            g_drag.painting = true;
+            g_drag.havePosition = true;
+            g_drag.lastX = cellX;
+            g_drag.lastY = cellY;
+            SetCapture(hwnd);
+            paintPosition(cellX, cellY);
+            requestRender();
+            result = 0;
+            return true;
+        }
+        break;
+    }
+
+    case WM_LBUTTONDBLCLK: {
+        const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        const int axis = rulerAxis(g_layout, g_surfaceWidth, g_surfaceHeight, g_uiScale, g_state.showRulers, x, y);
+        if (axis >= 0)
+        {
+            const double pixel = ((axis == 0 ? x : y) - (axis == 0 ? g_layout.originX : g_layout.originY)) /
+                                 g_layout.pxPerIn * g_state.imagePpi;
+            if (std::abs(pixel) <= 1000000000.0)
+            {
+                g_dragLine = -1;
+                ReleaseCapture();
+                g_history.commit();
+                g_history.captureGuides(g_state.lines);
+                GuideLine line;
+                line.vertical = axis == 0;
+                line.position = pixel;
+                g_state.lines.push_back(line);
+                g_state.highlightedLine = int(g_state.lines.size() - 1);
+                g_history.commit();
+                markDocumentModified();
+                requestCanvasRender();
+            }
+            result = 0;
+            return true;
+        }
+        return handleCanvasCaliperWindowMessage(hwnd, WM_LBUTTONDOWN, wParam, lParam, result);
+    }
+
+    case WM_LBUTTONUP:
+        if (g_dragCels)
+        {
+            g_dragCels = false;
+            ReleaseCapture();
+            result = 0;
+            return true;
+        }
+        if (g_dragPalette)
+        {
+            g_dragPalette = false;
+            ReleaseCapture();
+            result = 0;
+            return true;
+        }
+        if (g_dragLine >= 0)
+        {
+            moveDraggedLine(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            g_dragLine = -1;
+            updateGuideHighlight(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            g_history.commit();
+            ReleaseCapture();
+            result = 0;
+            return true;
+        }
+        if (g_drag.painting)
+        {
+            advanceStrokeAt(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            g_drag.painting = false;
+            g_history.commit();
+            schedulePalette();
+            ReleaseCapture();
+            result = 0;
+            return true;
+        }
+        break;
+
+    case WM_RBUTTONDOWN: {
         const int x = GET_X_LPARAM(lParam);
         const int y = GET_Y_LPARAM(lParam);
-        if (pointInsideImage(x, y))
+        const int axis = rulerAxis(g_layout, g_surfaceWidth, g_surfaceHeight, g_uiScale, g_state.showRulers, x, y);
+        if (axis >= 0)
+        {
+            const int index = hitGuide(g_state, g_layout, axis, axis == 0 ? x : y, ui(12));
+            if (index >= 0)
+                showLineDialog(hwnd, index);
+            result = 0;
+            return true;
+        }
+        if (!g_drag.painting && insideWorkspace(x, y))
         {
             g_drag.panning = true;
             g_drag.startPoint = {x, y};
-            g_drag.startOffsetXIn = g_state.offsetXIn;
-            g_drag.startOffsetYIn = g_state.offsetYIn;
+            g_drag.startOffsetXIn = g_panX;
+            g_drag.startOffsetYIn = g_panY;
             SetCapture(hwnd);
             result = 0;
             return true;
@@ -1871,7 +1508,6 @@ bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
     }
 
     case WM_RBUTTONUP:
-    case WM_CAPTURECHANGED:
         if (g_drag.panning)
         {
             g_drag.panning = false;
@@ -1882,41 +1518,151 @@ bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
         }
         break;
 
-    case WM_MOUSEWHEEL:
+    case WM_CAPTURECHANGED:
+        g_dragCels = false;
+        g_dragPalette = false;
+        if (g_drag.painting)
+            schedulePalette();
+        g_dragLine = -1;
+        {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(hwnd, &p);
+            updateGuideHighlight(p.x, p.y);
+        }
+        g_history.commit();
+        g_drag.painting = false;
+        g_drag.panning = false;
+        break;
+
+    case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &p);
         if ((GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0)
         {
-            const short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_state.zoomScale = clampDouble(delta > 0 ? g_state.zoomScale * kZoomStep : g_state.zoomScale / kZoomStep, 1.0, kMaxZoom);
-            syncControlsFromState();
-            requestCanvasRender();
+            zoomCanvas(std::pow(kZoomStep, double(delta) / WHEEL_DELTA), p.x, p.y);
+            result = 0;
+            return true;
+        }
+        if (g_state.tool == PaintTool::Brush)
+        {
+            g_brushWheelDelta += delta;
+            const int steps = g_brushWheelDelta / WHEEL_DELTA;
+            g_brushWheelDelta %= WHEEL_DELTA;
+            g_state.brushSize = std::clamp(g_state.brushSize + steps, 1, kMaxBrushSize);
+            requestRender();
+            result = 0;
+            return true;
+        }
+        const auto list = layoutCels(g_surfaceWidth, g_surfaceHeight, g_uiScale);
+        if (list.bounds.contains(p.x, p.y))
+        {
+            const auto maximum = g_state.cels.size() > std::size_t(list.rows) ? g_state.cels.size() - list.rows : 0;
+            g_state.celOffset = std::size_t(
+                std::clamp<std::int64_t>(std::int64_t(g_state.celOffset) - delta / WHEEL_DELTA, 0, maximum));
+            requestRender();
+            result = 0;
+            return true;
+        }
+        const auto layout = layoutPalette(g_surfaceWidth, g_uiScale, g_state.palette.size(), g_surfaceHeight);
+        if (layout.bounds.contains(p.x, p.y))
+        {
+            const auto delta = std::int64_t(GET_WHEEL_DELTA_WPARAM(wParam)) * layout.columns * 3 / WHEEL_DELTA;
+            const auto next = std::max<std::int64_t>(0, std::int64_t(g_state.paletteOffset) - delta);
+            g_state.paletteOffset = clampPaletteOffset(layout, g_state.palette.size(), std::size_t(next));
+            requestRender();
+            result = 0;
+            return true;
+        }
+        break;
+    }
+
+    case WM_KILLFOCUS:
+        setSecondaryActive(false);
+        if (g_drag.painting)
+        {
+            g_drag.painting = false;
+            g_history.commit();
+            schedulePalette();
+        }
+        if (GetCapture() == hwnd)
+            ReleaseCapture();
+        break;
+    case WM_SETFOCUS:
+        setSecondaryActive((GetKeyState(VK_MENU) & 0x8000) != 0);
+        break;
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+    case WM_KEYUP:
+        if (wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU)
+        {
+            setSecondaryActive(message == WM_SYSKEYDOWN);
             result = 0;
             return true;
         }
         break;
 
     case WM_KEYDOWN:
+        if (wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU)
+        {
+            setSecondaryActive(true);
+            result = 0;
+            return true;
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) == 0)
+        {
+            if (wParam == 'B')
+                selectPaintTool(PaintTool::Brush);
+            else if (wParam == 'C')
+                selectPaintTool(PaintTool::Cell);
+            else if (wParam == 'I')
+                selectPaintTool(PaintTool::Pick);
+        }
         if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
         {
+            if (wParam == 'Z' || wParam == 'Y')
+            {
+                editCanvasCaliperHistory(hwnd, wParam == 'Y' || (GetKeyState(VK_SHIFT) & 0x8000));
+                result = 0;
+                return true;
+            }
+            if (wParam == 'N')
+            {
+                PostMessageW(hwnd, WM_COMMAND, IDM_FILE_NEW, 0);
+                return true;
+            }
+            if (wParam == 'O')
+            {
+                PostMessageW(hwnd, WM_COMMAND, IDM_FILE_OPEN, 0);
+                return true;
+            }
+            if (wParam == 'S')
+            {
+                PostMessageW(hwnd, WM_COMMAND,
+                             (GetKeyState(VK_SHIFT) & 0x8000) ? IDM_FILE_SAVE_DOCUMENT_AS : IDM_FILE_SAVE, 0);
+                return true;
+            }
             if (wParam == '0')
             {
                 g_state.zoomScale = 1.0;
-                syncControlsFromState();
+                g_panX = g_panY = 0;
                 requestCanvasRender();
                 result = 0;
                 return true;
             }
             if (wParam == VK_OEM_PLUS || wParam == VK_ADD)
             {
-                g_state.zoomScale = clampDouble(g_state.zoomScale * kZoomStep, 1.0, kMaxZoom);
-                syncControlsFromState();
+                zoomCanvas(kZoomStep, (workspaceRect().left + workspaceRect().right) / 2,
+                           (workspaceRect().top + workspaceRect().bottom) / 2);
                 requestCanvasRender();
                 result = 0;
                 return true;
             }
             if (wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT)
             {
-                g_state.zoomScale = clampDouble(g_state.zoomScale / kZoomStep, 1.0, kMaxZoom);
-                syncControlsFromState();
+                zoomCanvas(1 / kZoomStep, (workspaceRect().left + workspaceRect().right) / 2,
+                           (workspaceRect().top + workspaceRect().bottom) / 2);
                 requestCanvasRender();
                 result = 0;
                 return true;
@@ -1941,15 +1687,25 @@ void updateCanvasCaliperMenu(HMENU menu)
     if (!menu)
         return;
 
+    EnableMenuItem(menu, IDM_EDIT_UNDO, MF_BYCOMMAND | (g_history.canUndo() ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, IDM_EDIT_REDO, MF_BYCOMMAND | (g_history.canRedo() ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, IDM_FILE_EXPORT_PNG, MF_BYCOMMAND | (g_state.hasImage ? MF_ENABLED : MF_GRAYED));
+    CheckMenuItem(menu, IDM_VIEW_LINES, MF_BYCOMMAND | (g_state.showLines ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_VIEW_GRID, MF_BYCOMMAND | (g_state.showGrid ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_VIEW_RULERS, MF_BYCOMMAND | (g_state.showRulers ? MF_CHECKED : MF_UNCHECKED));
 }
 
-CanvasRenderData buildCanvasRenderData(std::uint32_t width, std::uint32_t height)
+CanvasRenderData &buildCanvasRenderData(std::uint32_t width, std::uint32_t height)
 {
-    ensureToolbarTexture(width);
+    g_surfaceWidth = width;
+    g_surfaceHeight = height;
 
-    CanvasRenderData data;
+    static CanvasRenderData data;
+    data.surfaceWidth = width;
+    data.surfaceHeight = height;
+    data.hasImage = false;
+    data.overlays.clear();
+    data.overlays.reserve(12000);
     g_layout = computeLayout(width, height);
 
     if (g_state.hasImage)
@@ -1961,30 +1717,505 @@ CanvasRenderData buildCanvasRenderData(std::uint32_t width, std::uint32_t height
         data.imageHeight = static_cast<float>(g_state.imageHeightIn * g_layout.pxPerIn);
     }
 
-    buildOverlayGeometry(data, width, height, g_layout);
+    data.viewport = workspaceRect();
+    EditorUi chrome{g_state,
+                    g_layout,
+                    int(width),
+                    int(height),
+                    g_rulerUnits,
+                    g_uiScale,
+                    vulkanDeviceProperties().deviceName,
+                    std::move(g_uiHits)};
+    chrome.build(data);
+    g_uiHits = std::move(chrome.hits);
     return data;
 }
 
-bool canvasCaliperGridVisible()
+namespace
 {
-    return g_state.showGrid;
+bool dialogNumber(HWND dialog, int id, double low, double high, double &value)
+{
+    wchar_t buffer[96]{};
+    GetDlgItemTextW(dialog, id, buffer, 96);
+    wchar_t *end = nullptr;
+    value = std::wcstod(buffer, &end);
+    while (end && (*end == L' ' || *end == L'\t'))
+        ++end;
+    if (end == buffer || !end || *end || !std::isfinite(value) || value < low || value > high)
+    {
+        const std::wstring message = L"Enter a number from " + formatDouble(low) + L" to " + formatDouble(high) + L".";
+        MessageBoxW(dialog, message.c_str(), L"Check setting", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(dialog, id));
+        SendDlgItemMessageW(dialog, id, EM_SETSEL, 0, -1);
+        return false;
+    }
+    return true;
+}
+struct SettingsContext
+{
+    UINT command;
+    int gridUnits;
+};
+INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto *context = reinterpret_cast<SettingsContext *>(GetWindowLongPtrW(dialog, DWLP_USER));
+    const UINT command = context ? context->command : 0;
+    if (message == WM_INITDIALOG)
+    {
+        context = reinterpret_cast<SettingsContext *>(lParam);
+        const UINT mode = context->command;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        const HWND combo = GetDlgItem(dialog, IDC_SETTING_UNITS);
+        if (combo)
+        {
+            for (const wchar_t *label : {L"Pixels", L"Inches", L"Centimeters"})
+                SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+            SendMessageW(combo, CB_SETCURSEL, g_rulerUnits, 0);
+        }
+        if (mode == IDM_OPTIONS_GRID)
+        {
+            SetDlgItemTextW(
+                dialog, IDC_SETTING_VALUE,
+                formatNumber(g_state.gridSizeIn * rulerUnitsPerInch(g_rulerUnits, g_state.imagePpi)).c_str());
+            SetDlgItemInt(dialog, IDC_SETTING_MAJOR, g_state.majorEvery, FALSE);
+            CheckDlgButton(dialog, IDC_SETTING_VISIBLE, g_state.showGrid ? BST_CHECKED : BST_UNCHECKED);
+        }
+        else if (mode == IDM_OPTIONS_RULERS)
+            CheckDlgButton(dialog, IDC_SETTING_VISIBLE, g_state.showRulers ? BST_CHECKED : BST_UNCHECKED);
+        else
+        {
+            SetDlgItemTextW(dialog, IDC_SETTING_VALUE, formatDouble(g_state.imagePpi).c_str());
+            SetDlgItemInt(dialog, IDC_SETTING_WIDTH, g_state.image().width, FALSE);
+            SetDlgItemInt(dialog, IDC_SETTING_HEIGHT, g_state.image().height, FALSE);
+            const auto info = formatInt(g_state.image().width) + L" x " + formatInt(g_state.image().height) +
+                              L" pixels\n" + formatDouble(g_state.imageWidthIn) + L" x " +
+                              formatDouble(g_state.imageHeightIn) + L" inches";
+            SetDlgItemTextW(dialog, IDC_SETTING_INFO, info.c_str());
+        }
+        RECT owner{}, r{};
+        GetWindowRect(GetParent(dialog), &owner);
+        GetWindowRect(dialog, &r);
+        SetWindowPos(dialog, nullptr, owner.left + (owner.right - owner.left - r.right + r.left) / 2,
+                     owner.top + (owner.bottom - owner.top - r.bottom + r.top) / 2, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        return TRUE;
+    }
+    if (message == WM_COMMAND)
+    {
+        if (context && command == IDM_OPTIONS_GRID && LOWORD(wParam) == IDC_SETTING_UNITS &&
+            HIWORD(wParam) == CBN_SELCHANGE)
+        {
+            wchar_t buffer[96]{};
+            GetDlgItemTextW(dialog, IDC_SETTING_VALUE, buffer, 96);
+            const double value = std::wcstod(buffer, nullptr);
+            const int next = static_cast<int>(SendDlgItemMessageW(dialog, IDC_SETTING_UNITS, CB_GETCURSEL, 0, 0));
+            const auto factor = [](int units) { return units == 0 ? g_state.imagePpi : (units == 2 ? 2.54 : 1.0); };
+            if (std::isfinite(value) && value > 0)
+            {
+                std::swprintf(buffer, 96, L"%.9g", value / factor(context->gridUnits) * factor(next));
+                SetDlgItemTextW(dialog, IDC_SETTING_VALUE, buffer);
+            }
+            context->gridUnits = next;
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(dialog, 0);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDOK)
+        {
+            double value = 0, major = 0, w = 0, h = 0;
+            const int units = static_cast<int>(SendDlgItemMessageW(dialog, IDC_SETTING_UNITS, CB_GETCURSEL, 0, 0));
+            if (command == IDM_OPTIONS_GRID)
+            {
+                if (!dialogNumber(dialog, IDC_SETTING_VALUE, 0.000001, 10000000, value) ||
+                    !dialogNumber(dialog, IDC_SETTING_MAJOR, 0, 10000, major))
+                    return TRUE;
+                const double factor = units == 0 ? g_state.imagePpi : (units == 2 ? 2.54 : 1.0);
+                const double spacing = value / factor;
+                if (spacing * g_state.imagePpi < 0.999999 || spacing > 10000 || major != std::floor(major))
+                {
+                    MessageBoxW(
+                        dialog,
+                        L"Use a spacing of at least one image pixel, up to 10,000 inches, and a whole number of cells.",
+                        L"Check grid", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                g_state.gridSizeIn = spacing;
+                g_state.majorEvery = static_cast<int>(major);
+                g_state.showGrid = IsDlgButtonChecked(dialog, IDC_SETTING_VISIBLE) == BST_CHECKED;
+            }
+            else if (command == IDM_OPTIONS_RULERS)
+            {
+                g_rulerUnits = std::clamp(units, 0, 2);
+                g_state.showRulers = IsDlgButtonChecked(dialog, IDC_SETTING_VISIBLE) == BST_CHECKED;
+            }
+            else
+            {
+                if (!dialogNumber(dialog, IDC_SETTING_VALUE, 1, 5000, value))
+                    return TRUE;
+                if (command == IDM_FILE_NEW)
+                {
+                    if (!dialogNumber(dialog, IDC_SETTING_WIDTH, 1, 16384, w) ||
+                        !dialogNumber(dialog, IDC_SETTING_HEIGHT, 1, 16384, h))
+                        return TRUE;
+                    if (w != std::floor(w) || h != std::floor(h) || w * h > 64000000 ||
+                        w > vulkanDeviceProperties().limits.maxImageDimension2D ||
+                        h > vulkanDeviceProperties().limits.maxImageDimension2D)
+                    {
+                        MessageBoxW(dialog,
+                                    L"Use whole pixel dimensions totaling at most 64 million pixels, within the GPU "
+                                    L"texture limit.",
+                                    L"Check canvas size", MB_OK | MB_ICONWARNING);
+                        return TRUE;
+                    }
+                    createCanvasAsync(std::uint32_t(w), std::uint32_t(h), value);
+                }
+                else
+                {
+                    if (!changeImagePpi(g_state, value))
+                    {
+                        MessageBoxW(dialog, L"This PPI would exceed the supported physical canvas or grid bounds.",
+                                    L"Check PPI", MB_OK | MB_ICONWARNING);
+                        return TRUE;
+                    }
+                    markDocumentModified();
+                }
+            }
+            updateCanvasCaliperMenu(GetMenu(g_parent));
+            saveCanvasCaliperConfig();
+            requestCanvasRender();
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+} // namespace
+void showCanvasSettingsDialog(HWND owner, UINT command)
+{
+    const int resource = command == IDM_OPTIONS_GRID     ? IDD_GRID_SETTINGS
+                         : command == IDM_OPTIONS_RULERS ? IDD_RULER_SETTINGS
+                         : command == IDM_FILE_NEW       ? IDD_NEW_CANVAS
+                                                         : IDD_IMAGE_SETTINGS;
+    g_history.commit();
+    if (command == IDM_FILE_NEW && !confirmCanvasCaliperClose(owner))
+        return;
+    SettingsContext context{command, g_rulerUnits};
+    DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(resource), owner, SettingsProc,
+                    reinterpret_cast<LPARAM>(&context));
+    requestRender();
 }
 
-bool canvasCaliperRulersVisible()
+bool confirmCanvasCaliperClose(HWND owner)
 {
-    return g_state.showRulers;
+    if (!g_documentModified)
+        return true;
+    if (g_confirming)
+        return false;
+    g_confirming = true;
+    const int answer = MessageBoxW(owner, L"Save changes to this image?", L"SIMP", MB_YESNOCANCEL | MB_ICONQUESTION);
+    bool proceed = answer == IDNO;
+    if (answer == IDYES)
+    {
+        saveCanvasCaliperDocument(owner);
+        const bool enabled = IsWindowEnabled(owner) != FALSE;
+        if (enabled)
+            EnableWindow(owner, FALSE);
+        while (g_saving)
+        {
+            if (!processEvents())
+            {
+                PostQuitMessage(0);
+                break;
+            }
+            if (shouldRender())
+                renderFrame();
+            if (g_saving)
+                MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        if (enabled)
+            EnableWindow(owner, TRUE);
+        proceed = !g_documentModified;
+    }
+    g_confirming = false;
+    return proceed;
 }
 
-void setCanvasCaliperGridVisible(bool visible)
+namespace
 {
-    g_state.showGrid = visible;
-    updateCanvasCaliperMenu(GetMenu(g_parent));
-    requestCanvasRender();
+void positionDialogAtCursor(HWND dialog)
+{
+    POINT point{};
+    GetCursorPos(&point);
+    MONITORINFO monitor{sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &monitor);
+    RECT r{};
+    GetWindowRect(dialog, &r);
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    const int x = std::clamp<int>(point.x + 12, monitor.rcWork.left,
+                                  std::max<int>(monitor.rcWork.left, monitor.rcWork.right - w));
+    const int y =
+        std::clamp<int>(point.y + 12, monitor.rcWork.top, std::max<int>(monitor.rcWork.top, monitor.rcWork.bottom - h));
+    SetWindowPos(dialog, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+INT_PTR CALLBACK CelNameProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_INITDIALOG)
+    {
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        SendDlgItemMessageW(dialog, IDC_CEL_NAME, EM_SETLIMITTEXT, 128, 0);
+        SetDlgItemTextW(dialog, IDC_CEL_NAME, reinterpret_cast<std::wstring *>(lParam)->c_str());
+        SendDlgItemMessageW(dialog, IDC_CEL_NAME, EM_SETSEL, 0, -1);
+        positionDialogAtCursor(dialog);
+        return TRUE;
+    }
+    if (message == WM_COMMAND)
+    {
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDOK)
+        {
+            wchar_t name[129]{};
+            GetDlgItemTextW(dialog, IDC_CEL_NAME, name, 129);
+            std::wstring value = name;
+            const auto first = value.find_first_not_of(L" \t\r\n"), last = value.find_last_not_of(L" \t\r\n");
+            if (first == std::wstring::npos)
+            {
+                SetFocus(GetDlgItem(dialog, IDC_CEL_NAME));
+                return TRUE;
+            }
+            *reinterpret_cast<std::wstring *>(GetWindowLongPtrW(dialog, DWLP_USER)) =
+                value.substr(first, last - first + 1);
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+void renameActiveCel(HWND owner)
+{
+    auto name = g_state.cels[g_state.activeCel].name;
+    if (DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_CEL_NAME), owner, CelNameProc,
+                        reinterpret_cast<LPARAM>(&name)) == IDOK &&
+        name != g_state.cels[g_state.activeCel].name)
+    {
+        g_history.captureCels(g_state);
+        g_state.cels[g_state.activeCel].name = std::move(name);
+        g_history.commit();
+        markDocumentModified();
+        requestCanvasRender();
+    }
+}
+struct LineDialogState
+{
+    GuideLine line;
+    bool remove = false;
+};
+INT_PTR CALLBACK LineSettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto *state = reinterpret_cast<LineDialogState *>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (message == WM_INITDIALOG)
+    {
+        state = reinterpret_cast<LineDialogState *>(lParam);
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        SetDlgItemTextW(dialog, IDC_SETTING_VALUE, formatNumber(state->line.thickness).c_str());
+        const PaletteColor color{GetRValue(state->line.color), GetGValue(state->line.color),
+                                 GetBValue(state->line.color)};
+        SetDlgItemTextW(dialog, IDC_LINE_COLOR, formatHex(color).c_str());
+        positionDialogAtCursor(dialog);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && state)
+    {
+        switch (LOWORD(wParam))
+        {
+        case IDC_LINE_COLOR: {
+            static COLORREF custom[16]{};
+            CHOOSECOLORW choice{};
+            choice.lStructSize = sizeof(choice);
+            choice.hwndOwner = dialog;
+            choice.rgbResult = state->line.color;
+            choice.lpCustColors = custom;
+            choice.Flags = CC_FULLOPEN | CC_RGBINIT;
+            if (ChooseColorW(&choice))
+            {
+                state->line.color = choice.rgbResult;
+                const PaletteColor color{GetRValue(choice.rgbResult), GetGValue(choice.rgbResult),
+                                         GetBValue(choice.rgbResult)};
+                SetDlgItemTextW(dialog, IDC_LINE_COLOR, formatHex(color).c_str());
+            }
+            return TRUE;
+        }
+        case IDC_LINE_DELETE:
+            state->remove = true;
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDOK: {
+            double thickness = 0;
+            if (!dialogNumber(dialog, IDC_SETTING_VALUE, 1, 256, thickness))
+                return TRUE;
+            state->line.thickness = float(thickness);
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+void showLineDialog(HWND owner, int index)
+{
+    if (index < 0 || std::size_t(index) >= g_state.lines.size())
+        return;
+    g_lineOptions = index;
+    g_state.highlightedLine = index;
+    requestRender();
+    if (shouldRender())
+        renderFrame();
+    const auto old = g_state.lines[index];
+    LineDialogState state{old};
+    if (DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_LINE_SETTINGS), owner, LineSettingsProc,
+                        reinterpret_cast<LPARAM>(&state)) == IDOK &&
+        (state.remove || state.line != old))
+    {
+        g_history.commit();
+        g_history.captureGuides(g_state.lines);
+        if (state.remove)
+            g_state.lines.erase(g_state.lines.begin() + index);
+        else
+            g_state.lines[index] = state.line;
+        g_history.commit();
+        markDocumentModified();
+        requestCanvasRender();
+    }
+    g_lineOptions = -1;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(owner, &cursor);
+    updateGuideHighlight(cursor.x, cursor.y);
+    requestRender();
+}
+INT_PTR CALLBACK PngExportProc(HWND dialog, UINT message, WPARAM wParam, LPARAM)
+{
+    if (message == WM_INITDIALOG)
+    {
+        auto path = g_documentPath.empty() ? std::filesystem::path(g_state.imageName) : g_documentPath;
+        if (path.empty())
+            path = L"Untitled";
+        path.replace_extension(L".png");
+        SendDlgItemMessageW(dialog, IDC_EXPORT_PATH, EM_SETLIMITTEXT, 32767, 0);
+        SetDlgItemTextW(dialog, IDC_EXPORT_PATH, path.c_str());
+        SendDlgItemMessageW(dialog, IDC_EXPORT_FILTER, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(L"Adaptive (smaller files)"));
+        SendDlgItemMessageW(dialog, IDC_EXPORT_FILTER, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(L"None (faster encoding)"));
+        SendDlgItemMessageW(dialog, IDC_EXPORT_FILTER, CB_SETCURSEL, 0, 0);
+        positionDialogAtCursor(dialog);
+        return TRUE;
+    }
+    if (message == WM_COMMAND)
+    {
+        const auto command = LOWORD(wParam);
+        if (command == IDCANCEL)
+        {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        if (command == IDC_EXPORT_BROWSE)
+        {
+            std::array<wchar_t, 32768> name{};
+            GetDlgItemTextW(dialog, IDC_EXPORT_PATH, name.data(), int(name.size()));
+            OPENFILENAMEW save{};
+            save.lStructSize = sizeof(save);
+            save.hwndOwner = dialog;
+            save.lpstrFilter = L"PNG Images (*.png)\0*.png\0";
+            save.lpstrFile = name.data();
+            save.nMaxFile = DWORD(name.size());
+            save.lpstrDefExt = L"png";
+            save.lpstrTitle = L"Export to PNG";
+            save.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (GetSaveFileNameW(&save))
+                SetDlgItemTextW(dialog, IDC_EXPORT_PATH, name.data());
+            return TRUE;
+        }
+        if (command == IDOK)
+        {
+            std::array<wchar_t, 32768> name{};
+            GetDlgItemTextW(dialog, IDC_EXPORT_PATH, name.data(), int(name.size()));
+            if (!name[0])
+            {
+                SetFocus(GetDlgItem(dialog, IDC_EXPORT_PATH));
+                return TRUE;
+            }
+            std::filesystem::path path(name.data());
+            if (_wcsicmp(path.extension().c_str(), L".png"))
+            {
+                path.replace_extension(L".png");
+                SetDlgItemTextW(dialog, IDC_EXPORT_PATH, path.c_str());
+            }
+            std::error_code error;
+            if (!g_documentPath.empty() && std::filesystem::equivalent(path, g_documentPath, error))
+            {
+                MessageBoxW(dialog, L"Choose a different file. PNG export cannot replace the open native document.",
+                            L"Export to PNG", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            error.clear();
+            if (std::filesystem::exists(path, error) &&
+                MessageBoxW(dialog, L"Replace the existing PNG file?", L"Export to PNG", MB_YESNO | MB_ICONQUESTION) !=
+                    IDYES)
+                return TRUE;
+            const bool adaptive = SendDlgItemMessageW(dialog, IDC_EXPORT_FILTER, CB_GETCURSEL, 0, 0) == 0;
+            const bool interlace = IsDlgButtonChecked(dialog, IDC_EXPORT_INTERLACE) == BST_CHECKED;
+            const CelStack snapshot = g_state;
+            const double ppi = g_state.imagePpi;
+            const HWND owner = g_parent;
+            startCpuJob(
+                L"Exporting PNG...",
+                [snapshot, path, ppi, interlace, adaptive] {
+                    return encodePngFileBGRA(path, compositeCels(snapshot), ppi, interlace, adaptive);
+                },
+                [owner](bool success) {
+                    if (!success)
+                        MessageBoxW(owner, L"Could not export PNG. Check the path and available disk space.", L"SIMP",
+                                    MB_OK | MB_ICONERROR);
+                });
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+} // namespace
+void exportCanvasCaliperPngDialog(HWND owner)
+{
+    if (g_state.hasImage)
+        DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_PNG_EXPORT), owner, PngExportProc, 0);
+    requestRender();
 }
 
-void setCanvasCaliperRulersVisible(bool visible)
+void serviceCanvasBackgroundWork()
 {
-    g_state.showRulers = visible;
-    updateCanvasCaliperMenu(GetMenu(g_parent));
-    requestCanvasRender();
+    if (g_shutdown)
+        return;
+    // A completion may pump messages while waiting for a save. Leave later
+    // completions accessible to that nested pump instead of hiding a batch.
+    for (;;)
+    {
+        std::function<void()> done;
+        {
+            std::lock_guard lock(g_completionMutex);
+            if (g_completions.empty() || g_shutdown)
+                return;
+            done = std::move(g_completions.front());
+            g_completions.pop_front();
+        }
+        done();
+    }
 }

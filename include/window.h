@@ -14,7 +14,6 @@ struct DisplayInfo
 };
 
 extern HWND g_hwnd;
-extern bool g_menuActive;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 BOOL CALLBACK MonitorEnumProc(HMONITOR monitor, HDC monitorDc, LPRECT monitorRect, LPARAM userData);

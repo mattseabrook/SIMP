@@ -6,46 +6,27 @@
 
 #include <windows.h>
 
-struct CanvasOverlayRect
-{
-    std::int32_t x = 0;
-    std::int32_t y = 0;
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    float red = 0.0f;
-    float green = 0.0f;
-    float blue = 0.0f;
-    float alpha = 1.0f;
-};
-
-struct CanvasRenderData
-{
-    bool hasImage = false;
-    float imageX = 0.0f;
-    float imageY = 0.0f;
-    float imageWidth = 0.0f;
-    float imageHeight = 0.0f;
-    std::vector<CanvasOverlayRect> overlays;
-};
+#include "canvas_render.h"
 
 void initializeCanvasCaliper(HWND hwnd);
 void shutdownCanvasCaliper();
+void serviceCanvasBackgroundWork();
+bool confirmCanvasCaliperClose(HWND owner);
 void layoutCanvasCaliperChrome();
-void invalidateCanvasCaliperToolbar();
 void loadCanvasCaliperConfig();
 void saveCanvasCaliperConfig();
-void openCanvasCaliperImageDialog(HWND owner);
-bool loadCanvasCaliperImagePath(HWND owner, const wchar_t* path);
+bool loadCanvasCaliperImagePath(HWND owner, const wchar_t *path, bool restore = false);
 void openCanvasCaliperDocumentDialog(HWND owner);
 void saveCanvasCaliperDocumentAsDialog(HWND owner);
-void clearCanvasCaliperImage();
-bool handleCanvasCaliperCommand(HWND hwnd, WPARAM wParam, LPARAM lParam);
-bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);
+void saveCanvasCaliperDocument(HWND owner);
+void exportCanvasCaliperPngDialog(HWND owner);
+void editCanvasCaliperHistory(HWND owner, bool redo);
+void newCanvasCaliperImage();
+void flushCanvasCaliperEdits();
+void toggleCanvasView(HWND owner, UINT command);
+bool handleCanvasCaliperWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT &result);
 void updateCanvasCaliperMenu(HMENU menu);
-CanvasRenderData buildCanvasRenderData(std::uint32_t width, std::uint32_t height);
-bool canvasCaliperGridVisible();
-bool canvasCaliperRulersVisible();
-void setCanvasCaliperGridVisible(bool visible);
-void setCanvasCaliperRulersVisible(bool visible);
+CanvasRenderData &buildCanvasRenderData(std::uint32_t width, std::uint32_t height);
+void showCanvasSettingsDialog(HWND owner, UINT command);
 
 #endif

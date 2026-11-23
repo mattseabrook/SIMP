@@ -1,230 +1,426 @@
 #include "simpformat.h"
-
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <type_traits>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace
 {
 constexpr char kMagic[4] = {'S', 'I', 'M', 'P'};
-constexpr std::uint32_t kFormatVersion = 1;
-
-class ByteWriter
+constexpr std::uint32_t kVersion = 1;
+constexpr std::uint64_t kMaxPixels = 64000000;
+constexpr std::uint64_t kMaxPayload = kMaxPixels * 4 + 65536 + 64;
+class Writer
 {
-public:
-    template <typename T>
-    void writeRaw(const T& value)
+  public:
+    template <class T> void put(const T &value)
     {
-        static_assert(std::is_trivially_copyable_v<T>, "writeRaw requires a trivially copyable type");
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
-        buffer.insert(buffer.end(), bytes, bytes + sizeof(T));
+        static_assert(std::is_trivially_copyable_v<T>);
+        const auto *p = reinterpret_cast<const std::uint8_t *>(&value);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
     }
-
-    void writeBytes(const void* data, std::size_t size)
-    {
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        buffer.insert(buffer.end(), bytes, bytes + size);
-    }
-
-    std::vector<std::uint8_t> buffer;
+    std::vector<std::uint8_t> bytes;
 };
-
-class ByteReader
+class Reader
 {
-public:
-    ByteReader(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}
-
-    template <typename T>
-    bool readRaw(T& value)
+  public:
+    Reader(std::istream &input, std::uint64_t size) : input_(input), remaining_(size)
     {
-        static_assert(std::is_trivially_copyable_v<T>, "readRaw requires a trivially copyable type");
-        if (offset_ + sizeof(T) > size_)
+    }
+    template <class T> bool get(T &value)
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        return read(&value, sizeof(T));
+    }
+    bool pixels(PixelBuffer &out, std::size_t bytes)
+    {
+        if (bytes > remaining())
             return false;
-        std::memcpy(&value, data_ + offset_, sizeof(T));
-        offset_ += sizeof(T);
+        out.resize(bytes);
+        return read(out.data(), bytes);
+    }
+    bool name(std::wstring &out, bool cel)
+    {
+        std::uint32_t length = 0;
+        if (!get(length) || length > 32768 || (cel && !length) || length * 2 > remaining())
+            return false;
+        out.clear();
+        out.reserve(length);
+        std::uint16_t high = 0;
+        for (std::uint32_t i = 0; i < length; ++i)
+        {
+            std::uint16_t unit = 0;
+            if (!get(unit) || (cel && !unit))
+                return false;
+            if constexpr (sizeof(wchar_t) == 2)
+                if (!cel) // Legacy layer names preserved raw UTF-16 on Windows.
+                {
+                    out += wchar_t(unit);
+                    continue;
+                }
+            if (high)
+            {
+                if (unit < 0xdc00 || unit > 0xdfff)
+                    return false;
+                if constexpr (sizeof(wchar_t) == 2)
+                {
+                    out += wchar_t(high);
+                    out += wchar_t(unit);
+                }
+                else
+                    out += wchar_t(0x10000 + ((high - 0xd800) << 10) + (unit - 0xdc00));
+                high = 0;
+            }
+            else if (unit >= 0xd800 && unit <= 0xdbff)
+                high = unit;
+            else if (unit >= 0xdc00 && unit <= 0xdfff)
+                return false;
+            else
+                out += wchar_t(unit);
+        }
+        return !high;
+    }
+    std::uint64_t remaining() const
+    {
+        return remaining_;
+    }
+
+  private:
+    bool read(void *destination, std::size_t size)
+    {
+        if (size > remaining_ || !input_.read(static_cast<char *>(destination), size))
+            return false;
+        remaining_ -= size;
         return true;
     }
-
-    bool readBytes(void* out, std::size_t count)
-    {
-        if (offset_ + count > size_)
-            return false;
-        std::memcpy(out, data_ + offset_, count);
-        offset_ += count;
-        return true;
-    }
-
-    std::size_t remaining() const { return size_ - offset_; }
-
-private:
-    const std::uint8_t* data_;
-    std::size_t size_;
-    std::size_t offset_ = 0;
+    std::istream &input_;
+    std::uint64_t remaining_;
 };
-
-void writeChunk(std::ofstream& output, const char tag[4], const std::vector<std::uint8_t>& payload)
+bool finiteRange(double v, double low, double high)
 {
-    output.write(tag, 4);
-    const std::uint64_t length = payload.size();
-    output.write(reinterpret_cast<const char*>(&length), sizeof(length));
-    if (!payload.empty())
-        output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    return std::isfinite(v) && v >= low && v <= high;
 }
-
-std::vector<std::uint8_t> buildCanvasChunk(const SimpDocument& document)
+bool validCanvas(const SimpDocument &d)
 {
-    ByteWriter writer;
-    writer.writeRaw(document.canvasWidthIn);
-    writer.writeRaw(document.canvasHeightIn);
-    writer.writeRaw(document.gridSizeIn);
-    writer.writeRaw(document.majorEvery);
-    writer.writeRaw(document.paletteCount);
-    const std::uint8_t showGrid = document.showGrid ? 1 : 0;
-    const std::uint8_t showRulers = document.showRulers ? 1 : 0;
-    writer.writeRaw(showGrid);
-    writer.writeRaw(showRulers);
-    return std::move(writer.buffer);
+    return finiteRange(d.canvasWidthIn, 0.0002, 16384) && finiteRange(d.canvasHeightIn, 0.0002, 16384) &&
+           finiteRange(d.gridSizeIn, 0.000001, 10000) && d.majorEvery >= 0 && d.majorEvery <= 10000 &&
+           d.paletteCount >= 8 && d.paletteCount <= 64 && d.rulerUnits >= 0 && d.rulerUnits <= 2;
 }
-
-std::vector<std::uint8_t> buildLayerChunk(const SimpDocument& document)
+bool validImage(const DecodedImage &image)
 {
-    ByteWriter writer;
-    writer.writeRaw(document.layerOffsetXIn);
-    writer.writeRaw(document.layerOffsetYIn);
-    writer.writeRaw(document.layerPpi);
-
-    const std::uint32_t nameLength = static_cast<std::uint32_t>(document.layerName.size());
-    writer.writeRaw(nameLength);
-    if (nameLength > 0)
-        writer.writeBytes(document.layerName.data(), static_cast<std::size_t>(nameLength) * sizeof(wchar_t));
-
-    const std::uint32_t width = document.layerImage.width;
-    const std::uint32_t height = document.layerImage.height;
-    constexpr std::uint32_t kPixelFormatBgra8 = 0;
-    writer.writeRaw(width);
-    writer.writeRaw(height);
-    writer.writeRaw(kPixelFormatBgra8);
-    writer.writeBytes(document.layerImage.pixels.data(), document.layerImage.pixels.size());
-    return std::move(writer.buffer);
+    return image.width && image.height && image.width <= 16384 && image.height <= 16384 &&
+           std::uint64_t(image.width) * image.height <= kMaxPixels &&
+           image.pixels.size() == std::size_t(image.width) * image.height * 4;
 }
-}
-
-bool saveSimpDocument(const std::filesystem::path& path, const SimpDocument& document)
+void header(std::ofstream &out, const char *tag, std::uint64_t size)
 {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output)
+    out.write(tag, 4);
+    out.write(reinterpret_cast<const char *>(&size), 8);
+}
+void chunk(std::ofstream &out, const char *tag, const Writer &data)
+{
+    header(out, tag, data.bytes.size());
+    out.write(reinterpret_cast<const char *>(data.bytes.data()), data.bytes.size());
+}
+std::vector<std::uint16_t> utf16(const std::wstring &name)
+{
+    std::vector<std::uint16_t> out;
+    out.reserve(name.size());
+    for (auto character : name)
+    {
+        auto cp = static_cast<std::uint32_t>(character);
+        if (cp > 0xffff)
+        {
+            cp -= 0x10000;
+            out.push_back(0xd800 + (cp >> 10));
+            out.push_back(0xdc00 + (cp & 1023));
+        }
+        else
+            out.push_back(static_cast<std::uint16_t>(cp));
+    }
+    return out;
+}
+bool replaceFile(const std::filesystem::path &temporary, const std::filesystem::path &destination)
+{
+#ifdef _WIN32
+    return MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) !=
+           FALSE;
+#else
+    std::error_code error;
+    std::filesystem::rename(temporary, destination, error);
+    return !error;
+#endif
+}
+} // namespace
+
+bool saveSimpDocument(const std::filesystem::path &path, const SimpDocument &document,
+                      const DecodedImage *overrideImage)
+{
+    DecodedImage preview;
+    if (document.hasCels)
+    {
+        if (!validCelStack(document.stack))
+            return false;
+        preview = compositeCels(document.stack);
+    }
+    const auto &image = document.hasCels ? preview : (overrideImage ? *overrideImage : document.layerImage);
+    if (!validCanvas(document) ||
+        ((document.hasLayer || document.hasCels) && (!validImage(image) || !finiteRange(document.layerPpi, 1, 5000) ||
+                                                     !finiteRange(document.layerOffsetXIn, -10000, 10000) ||
+                                                     !finiteRange(document.layerOffsetYIn, -10000, 10000))))
         return false;
-
-    output.write(kMagic, sizeof(kMagic));
-    output.write(reinterpret_cast<const char*>(&kFormatVersion), sizeof(kFormatVersion));
-
-    writeChunk(output, "CNVS", buildCanvasChunk(document));
-    if (document.hasLayer && document.layerImage.width > 0 && document.layerImage.height > 0)
-        writeChunk(output, "LAY0", buildLayerChunk(document));
-
-    output.flush();
-    return static_cast<bool>(output);
+    for (const auto &line : document.lines)
+        if (!validGuide(line))
+            return false;
+    if (document.lines.size() > (kMaxPayload - 5) / 17)
+        return false;
+    const auto name = utf16(document.layerName);
+    if (name.size() > 32768)
+        return false;
+    auto temporary = path;
+    temporary += L".tmp";
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out.write(kMagic, 4);
+    out.write(reinterpret_cast<const char *>(&kVersion), 4);
+    Writer canvas;
+    canvas.put(document.canvasWidthIn);
+    canvas.put(document.canvasHeightIn);
+    canvas.put(document.gridSizeIn);
+    canvas.put(document.majorEvery);
+    canvas.put(document.paletteCount);
+    canvas.put(std::uint8_t(document.showGrid));
+    canvas.put(std::uint8_t(document.showRulers));
+    chunk(out, "CNVS", canvas);
+    Writer view;
+    view.put(document.rulerUnits);
+    chunk(out, "VIEW", view);
+    if (document.hasLayer || document.hasCels)
+    {
+        Writer layer;
+        layer.put(document.layerOffsetXIn);
+        layer.put(document.layerOffsetYIn);
+        layer.put(document.layerPpi);
+        layer.put(static_cast<std::uint32_t>(name.size()));
+        for (auto c : name)
+            layer.put(c);
+        layer.put(image.width);
+        layer.put(image.height);
+        layer.put(std::uint32_t(0));
+        header(out, "LAY0", layer.bytes.size() + image.pixels.size());
+        out.write(reinterpret_cast<const char *>(layer.bytes.data()), layer.bytes.size());
+        out.write(reinterpret_cast<const char *>(image.pixels.data()), image.pixels.size());
+    }
+    if (document.hasCels)
+    {
+        Writer stack;
+        stack.put(std::uint32_t(2));
+        stack.put(std::uint32_t(document.stack.cels.size()));
+        stack.put(document.stack.activeCel);
+        chunk(out, "CELS", stack);
+        for (const auto &cel : document.stack.cels)
+        {
+            const auto celName = utf16(cel.name);
+            if (celName.size() > 32768)
+            {
+                out.close();
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                return false;
+            }
+            Writer entry;
+            entry.put(cel.id);
+            entry.put(std::uint8_t(cel.visible));
+            entry.put(std::uint32_t(celName.size()));
+            for (auto c : celName)
+                entry.put(c);
+            entry.put(cel.image.width);
+            entry.put(cel.image.height);
+            const bool usePreview = document.stack.cels.size() == 1 && cel.visible;
+            entry.put(std::uint32_t(usePreview ? 1 : 0));
+            header(out, "CELD", entry.bytes.size() + (usePreview ? 0 : cel.image.pixels.size()));
+            out.write(reinterpret_cast<const char *>(entry.bytes.data()), entry.bytes.size());
+            if (!usePreview)
+                out.write(reinterpret_cast<const char *>(cel.image.pixels.data()), cel.image.pixels.size());
+        }
+    }
+    if (!document.lines.empty() || !document.showLines)
+    {
+        Writer guides;
+        guides.put(std::uint8_t(document.showLines));
+        guides.put(std::uint32_t(document.lines.size()));
+        for (const auto &line : document.lines)
+        {
+            guides.put(line.position);
+            guides.put(line.thickness);
+            guides.put(line.color);
+            guides.put(std::uint8_t(line.vertical));
+        }
+        chunk(out, "GLNS", guides);
+    }
+    out.flush();
+    const bool written = bool(out);
+    out.close();
+    if (written && !out.fail() && replaceFile(temporary, path))
+        return true;
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    return false;
 }
 
-bool loadSimpDocument(const std::filesystem::path& path, SimpDocument& document)
+bool loadSimpDocument(const std::filesystem::path &path, SimpDocument &document)
 {
     document = {};
-
-    std::ifstream input(path, std::ios::binary);
-    if (!input)
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in)
         return false;
-
-    char magic[4] = {};
-    input.read(magic, sizeof(magic));
-    if (!input || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0)
+    const auto end = in.tellg();
+    if (end < 8)
         return false;
-
-    std::uint32_t formatVersion = 0;
-    input.read(reinterpret_cast<char*>(&formatVersion), sizeof(formatVersion));
-    if (!input || formatVersion == 0 || formatVersion > kFormatVersion)
+    in.seekg(0);
+    char magic[4];
+    std::uint32_t version = 0;
+    in.read(magic, 4);
+    in.read(reinterpret_cast<char *>(&version), 4);
+    if (!in || std::memcmp(magic, kMagic, 4) || version != kVersion)
         return false;
-
-    while (true)
+    SimpDocument parsed;
+    bool canvasSeen = false, layerSeen = false, viewSeen = false, guidesSeen = false, celsSeen = false;
+    std::uint32_t expectedCels = 0, celsRevision = 0;
+    std::uint64_t celPixels = 0;
+    while (in.tellg() < end)
     {
-        char tag[4] = {};
-        input.read(tag, sizeof(tag));
-        if (!input)
-            break;  // clean EOF between chunks
-
-        std::uint64_t length = 0;
-        input.read(reinterpret_cast<char*>(&length), sizeof(length));
-        if (!input)
-            return false;  // truncated chunk header
-
-        std::vector<std::uint8_t> payload(static_cast<std::size_t>(length));
-        if (length > 0)
+        if (end - in.tellg() < 12)
+            return false;
+        char tag[4];
+        std::uint64_t size = 0;
+        in.read(tag, 4);
+        in.read(reinterpret_cast<char *>(&size), 8);
+        if (!in || size > static_cast<std::uint64_t>(end - in.tellg()))
+            return false;
+        const bool canvas = std::memcmp(tag, "CNVS", 4) == 0, layer = std::memcmp(tag, "LAY0", 4) == 0,
+                   view = std::memcmp(tag, "VIEW", 4) == 0, guides = std::memcmp(tag, "GLNS", 4) == 0,
+                   cels = std::memcmp(tag, "CELS", 4) == 0, celData = std::memcmp(tag, "CELD", 4) == 0;
+        if (!canvas && !layer && !view && !guides && !cels && !celData)
         {
-            input.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(length));
-            if (!input)
-                return false;  // truncated chunk payload
+            if (!in.seekg(static_cast<std::streamoff>(size), std::ios::cur))
+                return false;
+            continue;
         }
-
-        ByteReader reader(payload.data(), payload.size());
-
-        if (std::memcmp(tag, "CNVS", 4) == 0)
+        if (celData &&
+            (!celsSeen || parsed.stack.cels.size() >= expectedCels || size > (kMaxCelPixels - celPixels) * 4 + 65568))
+            return false;
+        if (size > kMaxPayload || ((canvas || view) && size > 1024))
+            return false;
+        Reader reader(in, size);
+        if (canvas)
         {
-            std::uint8_t showGrid = 1;
-            std::uint8_t showRulers = 1;
-            if (!reader.readRaw(document.canvasWidthIn) ||
-                !reader.readRaw(document.canvasHeightIn) ||
-                !reader.readRaw(document.gridSizeIn) ||
-                !reader.readRaw(document.majorEvery) ||
-                !reader.readRaw(document.paletteCount) ||
-                !reader.readRaw(showGrid) ||
-                !reader.readRaw(showRulers))
+            std::uint8_t grid = 0, rulers = 0;
+            if (canvasSeen || !reader.get(parsed.canvasWidthIn) || !reader.get(parsed.canvasHeightIn) ||
+                !reader.get(parsed.gridSizeIn) || !reader.get(parsed.majorEvery) || !reader.get(parsed.paletteCount) ||
+                !reader.get(grid) || !reader.get(rulers))
+                return false;
+            parsed.showGrid = grid != 0;
+            parsed.showRulers = rulers != 0;
+            canvasSeen = true;
+        }
+        else if (view)
+        {
+            if (viewSeen || !reader.get(parsed.rulerUnits))
+                return false;
+            viewSeen = true;
+        }
+        else if (guides)
+        {
+            std::uint8_t visible = 0;
+            std::uint32_t count = 0;
+            if (guidesSeen || !reader.get(visible) || visible > 1 || !reader.get(count) ||
+                std::uint64_t(count) * 17 != reader.remaining())
+                return false;
+            parsed.showLines = visible != 0;
+            parsed.lines.resize(count);
+            for (auto &line : parsed.lines)
             {
-                return false;
+                std::uint8_t vertical = 0;
+                if (!reader.get(line.position) || !reader.get(line.thickness) || !reader.get(line.color) ||
+                    !reader.get(vertical) || vertical > 1 || !validGuide(line))
+                    return false;
+                line.vertical = vertical != 0;
             }
-            document.showGrid = showGrid != 0;
-            document.showRulers = showRulers != 0;
+            guidesSeen = true;
         }
-        else if (std::memcmp(tag, "LAY0", 4) == 0)
+        else if (cels)
         {
-            std::uint32_t nameLength = 0;
-            if (!reader.readRaw(document.layerOffsetXIn) ||
-                !reader.readRaw(document.layerOffsetYIn) ||
-                !reader.readRaw(document.layerPpi) ||
-                !reader.readRaw(nameLength))
-            {
+            if (celsSeen || !reader.get(celsRevision) || (celsRevision != 1 && celsRevision != 2) ||
+                !reader.get(expectedCels) || !expectedCels || expectedCels > kMaxCels ||
+                !reader.get(parsed.stack.activeCel) || parsed.stack.activeCel >= expectedCels || reader.remaining())
                 return false;
-            }
-
-            document.layerName.assign(nameLength, L'\0');
-            if (nameLength > 0 && !reader.readBytes(document.layerName.data(), static_cast<std::size_t>(nameLength) * sizeof(wchar_t)))
-                return false;
-
-            std::uint32_t width = 0;
-            std::uint32_t height = 0;
-            std::uint32_t pixelFormat = 0;
-            if (!reader.readRaw(width) || !reader.readRaw(height) || !reader.readRaw(pixelFormat))
-                return false;
-            if (pixelFormat != 0 || width == 0 || height == 0)
-                return false;
-
-            const std::size_t pixelBytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
-            if (reader.remaining() < pixelBytes)
-                return false;
-
-            document.layerImage.width = width;
-            document.layerImage.height = height;
-            document.layerImage.pixels.resize(pixelBytes);
-            if (!reader.readBytes(document.layerImage.pixels.data(), pixelBytes))
-                return false;
-
-            document.hasLayer = true;
+            parsed.stack.cels.clear();
+            parsed.stack.cels.reserve(expectedCels);
+            parsed.hasCels = true;
+            celsSeen = true;
         }
-
-        // Any other chunk tag is silently skipped: that's the point of the
-        // chunked layout — future chunks (a layer stack, masks, adjustments)
-        // won't break this reader, and this reader already consumed exactly
-        // `length` bytes for the chunk above, so the stream stays in sync.
+        else if (celData)
+        {
+            Cel cel;
+            std::uint8_t visible = 0;
+            if (!reader.get(cel.id) || !cel.id || !reader.get(visible) || visible > 1 ||
+                !reader.name(cel.name, true) || !reader.get(cel.image.width) || !reader.get(cel.image.height))
+                return false;
+            cel.visible = visible != 0;
+            std::uint32_t encoding = 0;
+            if (celsRevision >= 2 && (!reader.get(encoding) || encoding > 1))
+                return false;
+            const auto pixels = std::uint64_t(cel.image.width) * cel.image.height;
+            if (!cel.image.width || !cel.image.height || cel.image.width > 16384 || cel.image.height > 16384 ||
+                pixels > kMaxPixels || pixels > kMaxCelPixels - celPixels)
+                return false;
+            if (encoding == 1)
+            {
+                if (!layerSeen || reader.remaining() || cel.image.width != parsed.layerImage.width ||
+                    cel.image.height != parsed.layerImage.height)
+                    return false;
+                cel.image.pixels = parsed.layerImage.pixels;
+            }
+            else if (reader.remaining() != pixels * 4 || !reader.pixels(cel.image.pixels, std::size_t(pixels) * 4))
+                return false;
+            celPixels += pixels;
+            parsed.stack.cels.push_back(std::move(cel));
+        }
+        else
+        {
+            std::uint32_t format = 0;
+            if (layerSeen || !reader.get(parsed.layerOffsetXIn) || !reader.get(parsed.layerOffsetYIn) ||
+                !reader.get(parsed.layerPpi) || !reader.name(parsed.layerName, false) ||
+                !reader.get(parsed.layerImage.width) || !reader.get(parsed.layerImage.height) ||
+                !reader.get(format) || format)
+                return false;
+            const auto w = parsed.layerImage.width, h = parsed.layerImage.height;
+            if (!w || !h || w > 16384 || h > 16384 || std::uint64_t(w) * h > kMaxPixels ||
+                !finiteRange(parsed.layerPpi, 1, 5000) || !finiteRange(parsed.layerOffsetXIn, -10000, 10000) ||
+                !finiteRange(parsed.layerOffsetYIn, -10000, 10000) ||
+                !reader.pixels(parsed.layerImage.pixels, std::size_t(w) * h * 4))
+                return false;
+            parsed.hasLayer = true;
+            layerSeen = true;
+        }
+        if (reader.remaining())
+            in.seekg(static_cast<std::streamoff>(reader.remaining()), std::ios::cur);
+        if (!in)
+            return false;
     }
-
+    if ((celsSeen && (parsed.stack.cels.size() != expectedCels || !validCelStack(parsed.stack))) || !canvasSeen ||
+        !validCanvas(parsed))
+        return false;
+    if (parsed.hasCels && (!parsed.hasLayer || parsed.layerImage.width != parsed.stack.image().width ||
+                           parsed.layerImage.height != parsed.stack.image().height))
+        return false;
+    document = std::move(parsed);
     return true;
 }

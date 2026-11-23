@@ -1,6 +1,11 @@
 #include "system.h"
 
 #include "config.h"
+#include "cpu_pixels.h"
+#include "cpu_work.h"
+#include "editor_theme.h"
+#include "splash_shadow.h"
+#include "splash_video.h"
 
 #include "../resource.h"
 
@@ -13,9 +18,12 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <process.h>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <utility>
 
 #include <dwmapi.h>
@@ -43,18 +51,18 @@ constexpr UINT kSplashTimerId = 1;
 constexpr UINT kSplashFrameIntervalMs = 1000 / 30;
 constexpr UINT kSplashFrameReadyMessage = WM_APP + 18;
 constexpr int kSplashHorizontalPadding = 72;
-constexpr int kSplashBottomPadding = 28;
-constexpr int kSplashTextBlockAnchorYPercent = 80;
-constexpr DWORD kDwmColorDefault = 0xFFFFFFFFu;
+constexpr int kSplashBottomPadding = 64;
+constexpr int kSplashTextBlockAnchorYPercent = 66;
 const wchar_t* kSplashWindowClassName = L"SimpSplashWindowClass";
-constexpr wchar_t kSplashAuthorUrl[] = L"https://www.mattseabrook.net";
+constexpr wchar_t kSplashAuthorUrl[] = L"https://www.lakeshoretechnical.com/";
+constexpr wchar_t kSplashVulkanUrl[] = L"https://www.vulkan.org/";
+constexpr std::wstring_view kSplashVersionText = L"v. " APP_VERSION_WSTRING;
 constexpr std::array<std::wstring_view, 4> kSplashTitleWords = {
     L"Simple",
     L"Image",
     L"Manipulation",
     L"Program"
 };
-constexpr std::wstring_view kSplashAuthorName = L"Matt Seabrook";
 
 IWICImagingFactory* g_wicFactory = nullptr;
 bool g_comInitialized = false;
@@ -75,30 +83,53 @@ struct SplashFrame
 {
     UINT width = 0;
     UINT height = 0;
-    std::vector<std::uint8_t> pixels;
-    BITMAPINFO bitmapInfo{};
+    PixelBuffer pixels;
+};
+
+struct SplashBranding
+{
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previousObject = nullptr;
+    RECT source{};
+    RECT destination{};
+    RECT hyperlink{};
+    int labelX = 0;
+    std::uint8_t* pixels = nullptr;
+    UINT stride = 0;
+};
+
+struct SplashTitleLayout
+{
+    std::array<int, 4> capitalWidths{};
+    std::array<int, 4> remainderWidths{};
+    int naturalWidth = 0;
+    int spaceWidth = 0;
+    TEXTMETRICW boldMetrics{};
+    TEXTMETRICW regularMetrics{};
+    TEXTMETRICW subtitleMetrics{};
 };
 
 struct SplashState
 {
-    std::vector<SplashFrame> frames;
-    std::size_t currentFrame = 0;
+    std::deque<SplashFrame> frames;
+    std::condition_variable frameConsumed;
     std::mutex framesMutex;
     HANDLE loaderThread = nullptr;
     std::atomic<bool> stopLoader = false;
     std::atomic<HWND> hwnd = nullptr;
-    HHOOK mouseHook = nullptr;
     HDC backBufferDC = nullptr;
     HBITMAP backBufferBitmap = nullptr;
     HGDIOBJ backBufferPreviousObject = nullptr;
     void* backBufferPixels = nullptr;
     UINT backBufferWidth = 0;
     UINT backBufferHeight = 0;
+    SplashBranding vulkan, author, shadow;
     HFONT titleBoldFont = nullptr;
     HFONT titleRegularFont = nullptr;
     HFONT subtitleFont = nullptr;
-    HFONT linkFont = nullptr;
-    RECT hyperlinkRect{};
+    SplashTitleLayout titleLayout;
+    int brandingLabelY = 0;
 };
 
 BITMAPINFO makeBitmapInfo(UINT width, UINT height);
@@ -126,12 +157,11 @@ void destroyFont(HFONT& font)
     }
 }
 
-HFONT createArialFont(int pixelHeight, LONG weight, bool underline = false)
+HFONT createArialFont(int pixelHeight, LONG weight, int widthPercent = 100)
 {
     LOGFONTW font{};
     font.lfHeight = -pixelHeight;
     font.lfWeight = weight;
-    font.lfUnderline = underline ? TRUE : FALSE;
     font.lfCharSet = DEFAULT_CHARSET;
 #ifdef CLEARTYPE_NATURAL_QUALITY
     font.lfQuality = CLEARTYPE_NATURAL_QUALITY;
@@ -139,7 +169,23 @@ HFONT createArialFont(int pixelHeight, LONG weight, bool underline = false)
     font.lfQuality = CLEARTYPE_QUALITY;
 #endif
     wcscpy_s(font.lfFaceName, LF_FACESIZE, L"Arial");
-    return CreateFontIndirectW(&font);
+    HFONT result = CreateFontIndirectW(&font);
+    if (result && widthPercent != 100)
+    {
+        HDC dc = GetDC(nullptr);
+        if (dc)
+        {
+            const auto previous = SelectObject(dc, result);
+            TEXTMETRICW metrics{};
+            GetTextMetricsW(dc, &metrics);
+            SelectObject(dc, previous);
+            ReleaseDC(nullptr, dc);
+            font.lfWidth = std::max(1, MulDiv(metrics.tmAveCharWidth, widthPercent, 100));
+            DeleteObject(result);
+            result = CreateFontIndirectW(&font);
+        }
+    }
+    return result;
 }
 
 SIZE measureTextExtent(HDC deviceContext, HFONT font, std::wstring_view text)
@@ -184,13 +230,13 @@ bool createSplashFonts(SplashState& state, int splashWidth)
         return false;
 
     const int availableWidth = std::max(256, splashWidth - (kSplashHorizontalPadding * 2));
-    int titleBoldHeight = 112;
-    int titleRegularHeight = 80;
+    int titleBoldHeight = 132;
+    int titleRegularHeight = 96;
 
     while (true)
     {
-        HFONT candidateBold = createArialFont(titleBoldHeight, FW_BOLD);
-        HFONT candidateRegular = createArialFont(titleRegularHeight, FW_NORMAL);
+        HFONT candidateBold = createArialFont(titleBoldHeight, FW_BOLD, 78);
+        HFONT candidateRegular = createArialFont(titleRegularHeight, FW_SEMIBOLD, 78);
         if (!candidateBold || !candidateRegular)
         {
             destroyFont(candidateBold);
@@ -212,34 +258,20 @@ bool createSplashFonts(SplashState& state, int splashWidth)
         --titleRegularHeight;
     }
 
-    const int subtitleHeight = std::max(18, titleRegularHeight / 3);
-    state.subtitleFont = createArialFont(subtitleHeight, FW_NORMAL);
-    state.linkFont = createArialFont(subtitleHeight, FW_NORMAL, true);
+    constexpr int subtitleHeight = 20;
+    state.subtitleFont = createArialFont(subtitleHeight, FW_SEMIBOLD);
 
-    const bool success = state.subtitleFont != nullptr && state.linkFont != nullptr;
+    const bool success = state.subtitleFont != nullptr;
     ReleaseDC(nullptr, deviceContext);
     if (!success)
     {
         destroyFont(state.titleBoldFont);
         destroyFont(state.titleRegularFont);
         destroyFont(state.subtitleFont);
-        destroyFont(state.linkFont);
     }
 
     return success;
 }
-
-struct SplashTitleLayout
-{
-    std::array<int, 4> capitalWidths{};
-    std::array<int, 4> remainderWidths{};
-    int naturalWidth = 0;
-    int spaceWidth = 0;
-    TEXTMETRICW boldMetrics{};
-    TEXTMETRICW regularMetrics{};
-    TEXTMETRICW subtitleMetrics{};
-    TEXTMETRICW linkMetrics{};
-};
 
 SplashTitleLayout measureSplashTitleLayout(HDC deviceContext, const SplashState& state)
 {
@@ -247,7 +279,6 @@ SplashTitleLayout measureSplashTitleLayout(HDC deviceContext, const SplashState&
     layout.boldMetrics = getFontMetrics(deviceContext, state.titleBoldFont);
     layout.regularMetrics = getFontMetrics(deviceContext, state.titleRegularFont);
     layout.subtitleMetrics = getFontMetrics(deviceContext, state.subtitleFont);
-    layout.linkMetrics = getFontMetrics(deviceContext, state.linkFont);
     layout.spaceWidth = measureTextExtent(deviceContext, state.titleRegularFont, L" ").cx;
     layout.naturalWidth = layout.spaceWidth * static_cast<int>(kSplashTitleWords.size() - 1);
 
@@ -262,25 +293,112 @@ SplashTitleLayout measureSplashTitleLayout(HDC deviceContext, const SplashState&
     return layout;
 }
 
-void drawTextRun(HDC deviceContext, HFONT font, int x, int y, std::wstring_view text, COLORREF textColor, COLORREF shadowColor, int shadowOffset)
+void drawTextRun(HDC deviceContext, HFONT font, int x, int y, std::wstring_view text, COLORREF color)
 {
-    if (!font || text.empty())
-        return;
-
-    HGDIOBJ previousFont = SelectObject(deviceContext, font);
-    SetTextColor(deviceContext, shadowColor);
-    TextOutW(deviceContext, x + shadowOffset, y + shadowOffset, text.data(), static_cast<int>(text.size()));
-    SetTextColor(deviceContext, textColor);
+    if (!font || text.empty()) return;
+    const auto previous = SelectObject(deviceContext, font);
+    SetTextColor(deviceContext, color);
     TextOutW(deviceContext, x, y, text.data(), static_cast<int>(text.size()));
-    SelectObject(deviceContext, previousFont);
+    SelectObject(deviceContext, previous);
 }
 
-void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT height)
+bool createSplashBitmap(SplashBranding& branding, const DecodedImage& image)
 {
-    if (!state.titleBoldFont || !state.titleRegularFont || !state.subtitleFont || !state.linkFont)
+    branding.dc = CreateCompatibleDC(nullptr);
+    if (!branding.dc) return false;
+    BITMAPINFO info = makeBitmapInfo(image.width, image.height);
+    void* pixels = nullptr;
+    branding.bitmap = CreateDIBSection(branding.dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!branding.bitmap || !pixels) return false;
+    std::memcpy(pixels, image.pixels.data(), image.pixels.size());
+    branding.previousObject = SelectObject(branding.dc, branding.bitmap);
+    branding.pixels = static_cast<std::uint8_t*>(pixels);
+    branding.stride = image.width * 4;
+    branding.source = {0, 0, LONG(image.width), LONG(image.height)};
+    return true;
+}
+
+bool createSplashBranding(SplashBranding& branding, int resourceId)
+{
+    DecodedImage logo;
+    if (!decodePngResourceBGRA(resourceId, logo))
+        return false;
+
+    // Crop transparent padding for placement, without changing source pixels.
+    RECT bounds{static_cast<LONG>(logo.width), static_cast<LONG>(logo.height), 0, 0};
+    auto* data = logo.pixels.data();
+    for (UINT y = 0; y < logo.height; ++y)
+        for (UINT x = 0; x < logo.width; ++x)
+        {
+            auto* pixel = data + (static_cast<std::size_t>(y) * logo.width + x) * 4;
+            const unsigned alpha = pixel[3];
+            if (alpha)
+            {
+                bounds.left = std::min(bounds.left, static_cast<LONG>(x));
+                bounds.top = std::min(bounds.top, static_cast<LONG>(y));
+                bounds.right = std::max(bounds.right, static_cast<LONG>(x + 1));
+                bounds.bottom = std::max(bounds.bottom, static_cast<LONG>(y + 1));
+            }
+            for (int channel = 0; channel < 3; ++channel)
+                pixel[channel] = static_cast<std::uint8_t>((pixel[channel] * alpha + 127) / 255);
+        }
+    if (bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+        return false;
+
+    if (!createSplashBitmap(branding, logo)) return false;
+    branding.source = bounds;
+    return true;
+}
+
+void destroySplashBranding(SplashBranding& branding)
+{
+    if (branding.dc && branding.previousObject)
+        SelectObject(branding.dc, branding.previousObject);
+    if (branding.bitmap)
+        DeleteObject(branding.bitmap);
+    if (branding.dc)
+        DeleteDC(branding.dc);
+    branding = {};
+}
+
+void layoutSplashOverlay(SplashState& state, int width, int height)
+{
+    state.titleLayout = measureSplashTitleLayout(state.backBufferDC, state);
+    const int labelHeight = state.titleLayout.subtitleMetrics.tmHeight;
+    const int vulkanWidth = MulDiv(state.vulkan.source.right - state.vulkan.source.left, 85, 100);
+    const int logoHeight = MulDiv(state.vulkan.source.bottom - state.vulkan.source.top, 85, 100);
+    constexpr int gap = 32, labelGap = 8, hitPadding = 6;
+    const int authorLimit = width - 2 * kSplashHorizontalPadding - vulkanWidth - gap;
+    const int authorSourceWidth = state.author.source.right - state.author.source.left;
+    const int authorSourceHeight = state.author.source.bottom - state.author.source.top;
+    const int authorWidth = std::max(1, std::min(authorLimit, MulDiv(logoHeight, authorSourceWidth, authorSourceHeight)));
+    const int authorHeight = std::max(1, MulDiv(authorWidth, authorSourceHeight, authorSourceWidth));
+    const int authorColumn = std::max<int>(authorWidth, measureTextExtent(state.backBufferDC, state.subtitleFont, L"Authored by").cx);
+    const int bottom = height - kSplashBottomPadding;
+    const int authorX = width - kSplashHorizontalPadding - authorColumn;
+    const int vulkanX = kSplashHorizontalPadding;
+    state.brandingLabelY = bottom - logoHeight - labelGap - labelHeight;
+    // Both branding blocks are 15% smaller; original bitmap pixels stay untouched.
+    state.vulkan.destination = {vulkanX, bottom - logoHeight, vulkanX + vulkanWidth, bottom};
+    const int authorY = bottom - logoHeight + (logoHeight - authorHeight) / 2;
+    state.author.destination = {authorX + (authorColumn - authorWidth) / 2, authorY,
+                               authorX + (authorColumn + authorWidth) / 2, authorY + authorHeight};
+    state.vulkan.hyperlink = {vulkanX, state.brandingLabelY, vulkanX + vulkanWidth, bottom};
+    state.author.hyperlink = {authorX, state.brandingLabelY, authorX + authorColumn, bottom};
+    const int poweredLabelWidth = measureTextExtent(state.backBufferDC, state.subtitleFont, L"Powered by").cx;
+    const int authorLabelWidth = measureTextExtent(state.backBufferDC, state.subtitleFont, L"Authored by").cx;
+    state.vulkan.labelX = vulkanX + (vulkanWidth - poweredLabelWidth) / 2;
+    state.author.labelX = authorX + (authorColumn - authorLabelWidth) / 2;
+    InflateRect(&state.vulkan.hyperlink, hitPadding, hitPadding);
+    InflateRect(&state.author.hyperlink, hitPadding, hitPadding);
+}
+
+void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT height, bool mask = false)
+{
+    if (!state.titleBoldFont || !state.titleRegularFont || !state.subtitleFont)
         return;
 
-    const SplashTitleLayout layout = measureSplashTitleLayout(deviceContext, state);
+    const SplashTitleLayout& layout = state.titleLayout;
     const int availableWidth = std::max(1, static_cast<int>(width) - (kSplashHorizontalPadding * 2));
     const int gapCount = static_cast<int>(kSplashTitleWords.size() - 1);
     const int freeWidth = std::max(0, availableWidth - layout.naturalWidth);
@@ -289,12 +407,13 @@ void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT h
     const int titleBaseline = (static_cast<int>(height) * kSplashTextBlockAnchorYPercent) / 100;
     const int capitalY = titleBaseline - layout.boldMetrics.tmAscent;
     const int remainderY = titleBaseline - layout.regularMetrics.tmAscent;
-    const COLORREF titleColor = RGB(248, 248, 248);
-    const COLORREF subtitleColor = RGB(236, 236, 236);
-    COLORREF linkColor = GetSysColor(COLOR_HOTLIGHT);
-    if (linkColor == 0)
-        linkColor = RGB(86, 156, 214);
-    const COLORREF shadowColor = RGB(12, 12, 12);
+    const COLORREF titleColor = mask ? RGB(255, 255, 255) : RGB(248, 248, 248);
+    const COLORREF subtitleColor = mask ? RGB(255, 255, 255) : RGB(236, 236, 236);
+    if (!mask && state.shadow.dc)
+    {
+        const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(deviceContext, 0, 0, width, height, state.shadow.dc, 0, 0, width, height, blend);
+    }
 
     const int previousBkMode = SetBkMode(deviceContext, TRANSPARENT);
 
@@ -302,34 +421,68 @@ void drawSplashOverlay(HDC deviceContext, SplashState& state, UINT width, UINT h
     for (std::size_t index = 0; index < kSplashTitleWords.size(); ++index)
     {
         const std::wstring_view word = kSplashTitleWords[index];
-        drawTextRun(deviceContext, state.titleBoldFont, x, capitalY, word.substr(0, 1), titleColor, shadowColor, 2);
+        drawTextRun(deviceContext, state.titleBoldFont, x, capitalY, word.substr(0, 1), titleColor);
         x += layout.capitalWidths[index];
-        drawTextRun(deviceContext, state.titleRegularFont, x, remainderY, word.substr(1), titleColor, shadowColor, 2);
+        drawTextRun(deviceContext, state.titleRegularFont, x, remainderY, word.substr(1), titleColor);
         x += layout.remainderWidths[index];
 
         if (index + 1 < kSplashTitleWords.size())
             x += layout.spaceWidth + gapBonus + (static_cast<int>(index) < gapRemainder ? 1 : 0);
     }
 
-    const std::wstring versionText = std::wstring(L"Version ") + APP_VERSION_WSTRING;
-    const std::wstring authoredPrefix = L"Authored by: ";
-    const int authoredPrefixWidth = measureTextExtent(deviceContext, state.subtitleFont, authoredPrefix).cx;
-    const int authorWidth = measureTextExtent(deviceContext, state.linkFont, kSplashAuthorName).cx;
-    const int authoredTotalWidth = authoredPrefixWidth + authorWidth;
-    const int bottomLineHeight = std::max(layout.subtitleMetrics.tmHeight, layout.linkMetrics.tmHeight);
-    const int bottomY = static_cast<int>(height) - kSplashBottomPadding - bottomLineHeight;
-    const int authoredX = static_cast<int>(width) - kSplashHorizontalPadding - authoredTotalWidth;
+    drawTextRun(deviceContext, state.subtitleFont, 64, 56, kSplashVersionText, subtitleColor);
 
-    drawTextRun(deviceContext, state.subtitleFont, kSplashHorizontalPadding, bottomY, versionText, subtitleColor, shadowColor, 1);
-    drawTextRun(deviceContext, state.subtitleFont, authoredX, bottomY, authoredPrefix, subtitleColor, shadowColor, 1);
-    drawTextRun(deviceContext, state.linkFont, authoredX + authoredPrefixWidth, bottomY, kSplashAuthorName, linkColor, shadowColor, 1);
-
-    state.hyperlinkRect.left = authoredX + authoredPrefixWidth - 2;
-    state.hyperlinkRect.top = bottomY - 2;
-    state.hyperlinkRect.right = authoredX + authoredTotalWidth + 2;
-    state.hyperlinkRect.bottom = bottomY + bottomLineHeight + 2;
+    const auto drawBranding = [&](const SplashBranding& branding, std::wstring_view label) {
+        if (!branding.dc || !branding.bitmap)
+            return;
+        const RECT& target = branding.destination;
+        const RECT& source = branding.source;
+        drawTextRun(deviceContext, state.subtitleFont, branding.labelX,
+                    state.brandingLabelY, label, subtitleColor);
+        if (mask) return;
+        const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(deviceContext, target.left, target.top, target.right - target.left, target.bottom - target.top,
+                   branding.dc, source.left, source.top, source.right - source.left, source.bottom - source.top, blend);
+    };
+    drawBranding(state.vulkan, L"Powered by");
+    drawBranding(state.author, L"Authored by");
 
     SetBkMode(deviceContext, previousBkMode);
+}
+
+bool createSplashShadow(SplashState& state)
+{
+    const int width = int(state.backBufferWidth), height = int(state.backBufferHeight);
+    DecodedImage image{state.backBufferWidth, state.backBufferHeight, {}};
+    image.pixels.resize(std::size_t(width) * height * 4);
+    if (!createSplashBitmap(state.shadow, image)) return false;
+    drawSplashOverlay(state.shadow.dc, state, width, height, true);
+    GdiFlush(); // GDI text writes RGB coverage, not a usable DIB alpha channel.
+    std::vector<std::uint8_t> coverage(std::size_t(width) * height);
+    for (std::size_t i = 0; i < coverage.size(); ++i)
+    {
+        const auto* pixel = state.shadow.pixels + i * 4;
+        coverage[i] = std::max({pixel[0], pixel[1], pixel[2]});
+    }
+    // Use original logo alpha, including opaque black artwork. Luminance would
+    // lose the black portions of the Lakeshore logo and weaken the Vulkan red.
+    const auto addLogo = [&](const SplashBranding& logo) {
+        const auto& at = logo.destination;
+        const auto& source = logo.source;
+        for (int y = std::max(0L, at.top); y < std::min<LONG>(height, at.bottom); ++y)
+            for (int x = std::max(0L, at.left); x < std::min<LONG>(width, at.right); ++x)
+            {
+                const auto sx = source.left + std::int64_t(x - at.left) * (source.right - source.left) / (at.right - at.left);
+                const auto sy = source.top + std::int64_t(y - at.top) * (source.bottom - source.top) / (at.bottom - at.top);
+                auto& alpha = coverage[std::size_t(y) * width + x];
+                alpha = std::max(alpha, logo.pixels[std::size_t(sy) * logo.stride + sx * 4 + 3]);
+            }
+    };
+    addLogo(state.vulkan);
+    addLogo(state.author);
+    const auto shadow = makeSplashShadow(coverage, width, height);
+    std::memcpy(state.shadow.pixels, shadow.data(), shadow.size());
+    return true;
 }
 
 bool createSplashBackBuffer(SplashState& state, UINT width, UINT height)
@@ -421,10 +574,11 @@ void destroySplashState(SplashState* state)
     if (!state)
         return;
 
-    state->stopLoader.store(true);
-
-    if (state->mouseHook)
-        UnhookWindowsHookEx(state->mouseHook);
+    {
+        std::scoped_lock lock(state->framesMutex);
+        state->stopLoader.store(true);
+    }
+    state->frameConsumed.notify_all();
 
     if (state->loaderThread)
     {
@@ -434,28 +588,14 @@ void destroySplashState(SplashState* state)
     }
 
     destroySplashBackBuffer(*state);
+    destroySplashBranding(state->vulkan);
+    destroySplashBranding(state->author);
+    destroySplashBranding(state->shadow);
     destroyFont(state->titleBoldFont);
     destroyFont(state->titleRegularFont);
     destroyFont(state->subtitleFont);
-    destroyFont(state->linkFont);
 
     delete state;
-}
-
-LRESULT CALLBACK SplashMouseHookProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code >= 0 && g_splashWindow)
-    {
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN)
-        {
-            const auto* hookData = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-            RECT splashRect{};
-            if (!GetWindowRect(g_splashWindow, &splashRect) || !PtInRect(&splashRect, hookData->pt))
-                PostMessageW(g_splashWindow, WM_CLOSE, 0, 0);
-        }
-    }
-
-    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 bool decodePngResourceBGRAWithFactory(IWICImagingFactory* factory, int resourceID, DecodedImage& image)
@@ -544,8 +684,7 @@ bool decodePngResourceBGRAWithFactory(IWICImagingFactory* factory, int resourceI
 // User-opened image files go through stb_image rather than WIC: it's a single
 // lightweight header with no COM lifetime to manage, and it covers PNG, JPEG,
 // BMP, TGA, GIF, PSD (flattened), HDR, PIC, and PNM in one path. Splash-screen
-// frames stay on the WIC decoder above since those are PNG resources baked
-// into the binary at build time.
+// branding and the static fallback poster use the WIC resource decoder above.
 bool decodeImageFileBGRAImpl(const std::filesystem::path& filename, DecodedImage& image)
 {
     image = {};
@@ -553,101 +692,75 @@ bool decodeImageFileBGRAImpl(const std::filesystem::path& filename, DecodedImage
     if (filename.empty())
         return false;
 
-    std::ifstream input(filename, std::ios::binary);
-    if (!input)
-        return false;
+    std::ifstream input(filename,std::ios::binary|std::ios::ate);
+    if(!input) return false;
+    const auto fileSize=input.tellg();
+    if(fileSize<=0 || fileSize>512*1024*1024) return false;
+    input.seekg(0);
+    std::vector<std::uint8_t> fileBytes(static_cast<std::size_t>(fileSize));
+    input.read(reinterpret_cast<char*>(fileBytes.data()),fileSize);
+    if(!input) return false;
+    int width=0,height=0,channelsInFile=0;
+    if(!stbi_info_from_memory(fileBytes.data(),static_cast<int>(fileBytes.size()),&width,&height,&channelsInFile) ||
+        width<=0 || height<=0 || width>16384 || height>16384 || std::uint64_t(width)*height>64000000) return false;
+    stbi_uc* decoded=stbi_load_from_memory(fileBytes.data(),static_cast<int>(fileBytes.size()),&width,&height,&channelsInFile,4);
+    if(!decoded) return false;
+    const std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> decodedOwner(decoded, stbi_image_free);
+    if(width<=0 || height<=0 || width>16384 || height>16384 || std::uint64_t(width)*height>64000000)
+    {return false;}
+    image.width=static_cast<UINT>(width);image.height=static_cast<UINT>(height);
+    image.pixels.resize(static_cast<std::size_t>(width)*height*4);
 
-    const std::vector<std::uint8_t> fileBytes(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-    if (fileBytes.empty() || fileBytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-        return false;
+    auto* destination=image.pixels.data();
+    const auto count=std::size_t(width)*height;
+    parallelCpuRange(count,262144,[&](std::size_t begin,std::size_t end)
+    {convertRgbaToBgra(destination+begin*4,decoded+begin*4,end-begin);});
 
-    int width = 0;
-    int height = 0;
-    int channelsInFile = 0;
-    stbi_uc* decoded = stbi_load_from_memory(fileBytes.data(), static_cast<int>(fileBytes.size()), &width, &height, &channelsInFile, 4);
-    if (!decoded || width <= 0 || height <= 0)
-        return false;
-
-    image.width = static_cast<UINT>(width);
-    image.height = static_cast<UINT>(height);
-    image.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-
-    // stb_image always hands back RGBA for a 4-channel request; SIMP's Vulkan
-    // texture and every existing pixel consumer (probe, palette) expect BGRA.
-    const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-    for (std::size_t pixel = 0; pixel < pixelCount; ++pixel)
-    {
-        const std::size_t index = pixel * 4;
-        image.pixels[index + 0] = decoded[index + 2];
-        image.pixels[index + 1] = decoded[index + 1];
-        image.pixels[index + 2] = decoded[index + 0];
-        image.pixels[index + 3] = decoded[index + 3];
-    }
-
-    stbi_image_free(decoded);
     return true;
-}
-
-std::size_t countSplashFrameResources()
-{
-    std::size_t count = 0;
-    HMODULE module = GetModuleHandleW(nullptr);
-    for (int resourceId = IDR_SPLASH_FRAME_FIRST; FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA); ++resourceId)
-        ++count;
-
-    return count;
 }
 
 unsigned __stdcall SplashLoaderThreadProc(void* parameter)
 {
     auto* state = static_cast<SplashState*>(parameter);
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool uninitializeCom = SUCCEEDED(comResult);
-    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE)
-        return 0;
-
-    IWICImagingFactory* threadFactory = nullptr;
-    const HRESULT factoryResult = CoCreateInstance(
-        CLSID_WICImagingFactory,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&threadFactory));
-
-    if (FAILED(factoryResult))
+    if (FAILED(comResult)) return 0;
+    SetThreadDescription(GetCurrentThread(), L"SIMP splash video decode");
+    try
     {
-        if (uninitializeCom)
-            CoUninitialize();
-        return 0;
-    }
-
-    for (int resourceId = IDR_SPLASH_FRAME_FIRST + 1; !state->stopLoader.load(); ++resourceId)
-    {
-        DecodedImage image;
-        if (!decodePngResourceBGRAWithFactory(threadFactory, resourceId, image))
-            break;
-
-        SplashFrame frame;
-        frame.width = image.width;
-        frame.height = image.height;
-        frame.pixels = std::move(image.pixels);
-        frame.bitmapInfo = makeBitmapInfo(frame.width, frame.height);
-
+        SplashVideo video(GetModuleHandleW(nullptr), IDR_SPLASH_VIDEO,
+                          state->backBufferWidth, state->backBufferHeight);
+        DecodedImage first;
+        if (!video.read(first)) throw std::runtime_error("Splash video has no frames.");
+        first = {}; // The original PNG poster already supplies frame zero.
+        while (!state->stopLoader.load())
         {
-            std::scoped_lock lock(state->framesMutex);
-            state->frames.push_back(std::move(frame));
+            {
+                std::unique_lock lock(state->framesMutex);
+                state->frameConsumed.wait(lock, [state] {
+                    return state->stopLoader.load() || state->frames.size() < 3;
+                });
+                if (state->stopLoader.load()) break;
+            }
+            DecodedImage image;
+            if (!video.read(image) || state->stopLoader.load()) break;
+            SplashFrame frame;
+            frame.width = image.width;
+            frame.height = image.height;
+            frame.pixels = std::move(image.pixels);
+            {
+                std::scoped_lock lock(state->framesMutex);
+                state->frames.push_back(std::move(frame));
+            }
+            if (const auto hwnd = state->hwnd.load())
+                PostMessageW(hwnd, kSplashFrameReadyMessage, 0, 0);
         }
-
-        HWND hwnd = state->hwnd.load();
-        if (hwnd)
-            PostMessageW(hwnd, kSplashFrameReadyMessage, 0, 0);
     }
-
-    safeRelease(threadFactory);
-    if (uninitializeCom)
-        CoUninitialize();
-
+    catch (...)
+    {
+        // Keep the poster/last decoded frame, hyperlinks and click dismissal if
+        // optional Windows codecs are missing or playback fails.
+    }
+    CoUninitialize();
     return 0;
 }
 
@@ -676,11 +789,14 @@ LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             std::scoped_lock lock(state->framesMutex);
             frameCount = state->frames.size();
             if (frameCount > 1)
-                state->currentFrame = (state->currentFrame + 1) % frameCount;
+                state->frames.pop_front();
         }
 
         if (frameCount > 1)
+        {
+            state->frameConsumed.notify_one();
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     }
 
@@ -692,8 +808,13 @@ LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     {
         SplashState* state = getSplashState(hwnd);
         POINT clickPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        if (state && PtInRect(&state->hyperlinkRect, clickPoint))
-            ShellExecuteW(hwnd, L"open", kSplashAuthorUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        const wchar_t* url = nullptr;
+        if (state && PtInRect(&state->vulkan.hyperlink, clickPoint))
+            url = kSplashVulkanUrl;
+        else if (state && PtInRect(&state->author.hyperlink, clickPoint))
+            url = kSplashAuthorUrl;
+        if (url)
+            ShellExecuteW(hwnd, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
 
         DestroyWindow(hwnd);
         return 0;
@@ -701,7 +822,6 @@ LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
 
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
-    case WM_KEYDOWN:
         DestroyWindow(hwnd);
         return 0;
 
@@ -712,7 +832,8 @@ LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             POINT cursorPoint{};
             GetCursorPos(&cursorPoint);
             ScreenToClient(hwnd, &cursorPoint);
-            if (state && PtInRect(&state->hyperlinkRect, cursorPoint))
+            if (state && (PtInRect(&state->vulkan.hyperlink, cursorPoint) ||
+                          PtInRect(&state->author.hyperlink, cursorPoint)))
             {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
                 return TRUE;
@@ -737,8 +858,7 @@ LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 std::scoped_lock lock(state->framesMutex);
                 if (!state->frames.empty())
                 {
-                    state->currentFrame = std::min(state->currentFrame, state->frames.size() - 1);
-                    const SplashFrame& frame = state->frames[state->currentFrame];
+                    const SplashFrame& frame = state->frames.front();
                     std::memcpy(state->backBufferPixels, frame.pixels.data(), frame.pixels.size());
                     frameWidth = frame.width;
                     frameHeight = frame.height;
@@ -809,6 +929,7 @@ bool initializeSystemServices()
 
 void shutdownSystemServices()
 {
+    closeSplashScreen();
     safeRelease(g_wicFactory);
 
     if (g_comInitialized)
@@ -828,11 +949,6 @@ const ThemePalette& getThemePalette()
     return g_themePalette;
 }
 
-COLORREF getThemeColorRef()
-{
-    return RGB(g_themePalette.red, g_themePalette.green, g_themePalette.blue);
-}
-
 void applyWindowTheme(HWND hwnd)
 {
     if (!hwnd)
@@ -842,8 +958,10 @@ void applyWindowTheme(HWND hwnd)
     // OS theme, so every top-level window and dialog gets the immersive dark frame.
     const BOOL useDarkMode = TRUE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
-    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
-    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &kDwmColorDefault, sizeof(kDwmColorDefault));
+    const COLORREF captionColor = EditorTheme::kCaption;
+    const COLORREF textColor = EditorTheme::kText;
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &captionColor, sizeof(captionColor));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &textColor, sizeof(textColor));
     RedrawWindow(hwnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
@@ -876,17 +994,15 @@ bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)
     }
 
     DecodedImage image;
-    if (!decodePngResourceBGRA(IDR_SPLASH_FRAME_FIRST, image))
+    if (!decodePngResourceBGRA(IDR_SPLASH_POSTER, image))
         return false;
 
     auto* state = new SplashState();
-    state->frames.reserve(std::max<std::size_t>(countSplashFrameResources(), 1));
 
     SplashFrame firstFrame;
     firstFrame.width = image.width;
     firstFrame.height = image.height;
     firstFrame.pixels = std::move(image.pixels);
-    firstFrame.bitmapInfo = makeBitmapInfo(firstFrame.width, firstFrame.height);
     state->frames.push_back(std::move(firstFrame));
 
     const int splashWidth = static_cast<int>(state->frames.front().width);
@@ -903,6 +1019,27 @@ bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)
         return false;
     }
 
+    if (!createSplashBranding(state->vulkan, IDR_BRANDING_VULKAN) ||
+        !createSplashBranding(state->author, IDR_BRANDING_LAKESHORE))
+    {
+        destroySplashState(state);
+        return false;
+    }
+
+    layoutSplashOverlay(*state, splashWidth, splashHeight);
+    try
+    {
+        if (!createSplashShadow(*state))
+        {
+            destroySplashState(state);
+            return false;
+        }
+    }
+    catch (...)
+    {
+        destroySplashState(state);
+        throw;
+    }
     const RECT splashRect = centerRectOnBounds(monitorBounds, splashWidth, splashHeight);
 
     HWND splashWindow = CreateWindowExW(
@@ -927,7 +1064,6 @@ bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)
 
     g_splashWindow = splashWindow;
     state->hwnd.store(splashWindow);
-    state->mouseHook = SetWindowsHookExW(WH_MOUSE_LL, SplashMouseHookProc, instance, 0);
     state->loaderThread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, SplashLoaderThreadProc, state, 0, nullptr));
 
     ShowWindow(splashWindow, SW_SHOWNOACTIVATE);
@@ -935,4 +1071,48 @@ bool showSplashScreen(HINSTANCE instance, HWND owner, const RECT& monitorBounds)
     SetTimer(splashWindow, kSplashTimerId, kSplashFrameIntervalMs, nullptr);
 
     return true;
+}
+
+void closeSplashScreen()
+{
+    if (g_splashWindow) DestroyWindow(g_splashWindow);
+}
+
+bool encodePngFileBGRA(const std::filesystem::path& filename,const DecodedImage& image,double ppi,bool interlace,bool adaptiveFilter)
+{
+    if(!image.width || !image.height || image.pixels.size()!=std::size_t(image.width)*image.height*4) return false;
+    const HRESULT initialized=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    if(FAILED(initialized) && initialized!=RPC_E_CHANGED_MODE) return false;
+    IWICImagingFactory* factory=nullptr;
+    static std::atomic<std::uint64_t> exportId{0};
+    auto temporary = filename;
+    temporary += L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                 std::to_wstring(exportId.fetch_add(1)) + L".tmp";
+    IWICStream* stream=nullptr;IWICBitmapEncoder* encoder=nullptr;IWICBitmapFrameEncode* frame=nullptr;
+    IPropertyBag2* options=nullptr;
+    HRESULT result=CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&factory));
+    if(SUCCEEDED(result)) result=factory->CreateStream(&stream);
+    if(SUCCEEDED(result)) result=stream->InitializeFromFilename(temporary.c_str(),GENERIC_WRITE);
+    if(SUCCEEDED(result)) result=factory->CreateEncoder(GUID_ContainerFormatPng,nullptr,&encoder);
+    if(SUCCEEDED(result)) result=encoder->Initialize(stream,WICBitmapEncoderNoCache);
+    if(SUCCEEDED(result)) result=encoder->CreateNewFrame(&frame,&options);
+    if(SUCCEEDED(result))
+    {
+        PROPBAG2 properties[2]{};properties[0].pstrName=const_cast<wchar_t*>(L"InterlaceOption");properties[1].pstrName=const_cast<wchar_t*>(L"FilterOption");
+        VARIANT values[2]{};values[0].vt=VT_BOOL;values[0].boolVal=interlace?VARIANT_TRUE:VARIANT_FALSE;
+        values[1].vt=VT_UI1;values[1].bVal=BYTE(adaptiveFilter?WICPngFilterAdaptive:WICPngFilterNone);
+        result=options->Write(2,properties,values);
+    }
+    if(SUCCEEDED(result)) result=frame->Initialize(options);
+    if(SUCCEEDED(result)) result=frame->SetSize(image.width,image.height);
+    if(SUCCEEDED(result)) result=frame->SetResolution(ppi,ppi);
+    WICPixelFormatGUID format=GUID_WICPixelFormat32bppBGRA;
+    if(SUCCEEDED(result)) result=frame->SetPixelFormat(&format);
+    if(SUCCEEDED(result) && !IsEqualGUID(format,GUID_WICPixelFormat32bppBGRA)) result=E_FAIL;
+    if(SUCCEEDED(result)) result=frame->WritePixels(image.height,image.width*4,UINT(image.pixels.size()),const_cast<BYTE*>(image.pixels.data()));
+    if(SUCCEEDED(result)) result=frame->Commit();
+    if(SUCCEEDED(result)) result=encoder->Commit();
+    safeRelease(options);safeRelease(frame);safeRelease(encoder);safeRelease(stream);safeRelease(factory);if(SUCCEEDED(initialized)) CoUninitialize();
+    if(SUCCEEDED(result) && MoveFileExW(temporary.c_str(),filename.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) return true;
+    std::error_code ignored;std::filesystem::remove(temporary,ignored);return false;
 }

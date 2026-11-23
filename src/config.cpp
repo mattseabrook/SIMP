@@ -2,6 +2,7 @@
 #include "window.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <stdexcept>
@@ -19,16 +20,16 @@ namespace
 {
 nlohmann::json makeDefaultConfig()
 {
-    return {
-        {"renderer", "VULKAN"},
-        {"fullscreen", false},
-        {"maximized", false},
-        {"display", 1},
-        {"x", 96},
-        {"y", 96},
-        {"width", DEFAULT_CLIENT_WIDTH},
-        {"height", DEFAULT_CLIENT_HEIGHT}
-    };
+    return {{"renderer", "VULKAN"},
+            {"lastOpenFile", ""},
+            {"fullscreen", false},
+            {"maximized", false},
+            {"display", 1},
+            {"x", 96},
+            {"y", 96},
+            {"width", DEFAULT_CLIENT_WIDTH},
+            {"height", DEFAULT_CLIENT_HEIGHT},
+            {"dpi", 96}};
 }
 
 std::filesystem::path getExecutableDirectory()
@@ -40,57 +41,42 @@ std::filesystem::path getExecutableDirectory()
     return std::filesystem::path(buffer).parent_path();
 }
 
-template <typename T>
-void assignOrDefault(const char* key, const T& defaultValue)
-{
-    if (!config.contains(key) || config[key].is_null())
-        config[key] = defaultValue;
-}
-
 void sanitizeConfig()
 {
+    const auto defaults = makeDefaultConfig();
     if (!config.is_object())
-        config = makeDefaultConfig();
+        config = defaults;
+    for (const auto &[key, fallback] : defaults.items())
+    {
+        auto &value = config[key];
+        if (fallback.is_number_integer() ? !value.is_number_integer() : value.type() != fallback.type())
+            value = fallback;
+    }
 
-    assignOrDefault("renderer", std::string("VULKAN"));
-    assignOrDefault("fullscreen", false);
-    assignOrDefault("maximized", false);
-    assignOrDefault("display", 1);
-    assignOrDefault("x", 96);
-    assignOrDefault("y", 96);
-    assignOrDefault("width", DEFAULT_CLIENT_WIDTH);
-    assignOrDefault("height", DEFAULT_CLIENT_HEIGHT);
-
-    if (!config["renderer"].is_string())
-        config["renderer"] = "VULKAN";
-    if (!config["fullscreen"].is_boolean())
-        config["fullscreen"] = false;
-    if (!config["maximized"].is_boolean())
-        config["maximized"] = false;
-    if (!config["display"].is_number_integer())
-        config["display"] = 1;
-    if (!config["x"].is_number_integer())
-        config["x"] = 96;
-    if (!config["y"].is_number_integer())
-        config["y"] = 96;
-    if (!config["width"].is_number_integer())
-        config["width"] = DEFAULT_CLIENT_WIDTH;
-    if (!config["height"].is_number_integer())
-        config["height"] = DEFAULT_CLIENT_HEIGHT;
-
+    const struct
+    {
+        const char *key;
+        int low, high;
+    } limits[] = {{"display", 1, 64}, {"width", MIN_CLIENT_WIDTH, 16384}, {"height", MIN_CLIENT_HEIGHT, 16384},
+                  {"x", -65536, 65536}, {"y", -65536, 65536}, {"dpi", 48, 768}};
+    for (const auto &[key, low, high] : limits)
+    {
+        auto &value = config[key];
+        const auto number = value.is_number_unsigned()
+                                ? std::int64_t(std::min(value.get<std::uint64_t>(), std::uint64_t(high)))
+                                : value.get<std::int64_t>();
+        value = int(std::clamp(number, std::int64_t(low), std::int64_t(high)));
+    }
     config["renderer"] = "VULKAN";
-    config["display"] = std::max(1, config["display"].get<int>());
-    config["width"] = std::max(MIN_CLIENT_WIDTH, config["width"].get<int>());
-    config["height"] = std::max(MIN_CLIENT_HEIGHT, config["height"].get<int>());
 }
-}
+} // namespace
 
 std::filesystem::path getConfigPath()
 {
     return getExecutableDirectory() / "config.json";
 }
 
-void load_config(const std::filesystem::path& filename)
+void load_config(const std::filesystem::path &filename)
 {
     config = makeDefaultConfig();
 
@@ -126,14 +112,31 @@ void load_config(const std::filesystem::path& filename)
         save_config(filename);
 }
 
-void save_config(const std::filesystem::path& filename)
+void save_config(const std::filesystem::path &filename)
 {
     updateConfigFromWindow();
     sanitizeConfig();
 
-    std::ofstream output(filename);
-    if (!output.is_open())
-        throw std::runtime_error("Failed to save configuration file: " + filename.string());
+    std::filesystem::path temporary = filename;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::trunc);
+        if (!output.is_open())
+            throw std::runtime_error("Failed to open temporary configuration file: " + temporary.string());
+        output << std::setw(4) << config << '\n';
+        output.close();
+        if (!output)
+        {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            throw std::runtime_error("Failed to write configuration file: " + temporary.string());
+        }
+    }
 
-    output << std::setw(4) << config << '\n';
+    if (!MoveFileExW(temporary.c_str(), filename.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("Failed to replace configuration file: " + filename.string());
+    }
 }

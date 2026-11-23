@@ -20,10 +20,6 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
-// The SSE2 JPEG IDCT fast path doesn't link cleanly when cross-compiling to the
-// MSVC ABI with clang+lld-link (the intrinsics fail to resolve at link time);
-// disable it and fall back to stb_image's portable scalar IDCT.
-#define STBI_NO_SIMD
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #include "stb/stb_image.h"

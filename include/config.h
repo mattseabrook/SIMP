@@ -6,17 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
-#if __has_include("version.generated.h")
-#include "version.generated.h"
-#endif
-
-#ifndef APP_VERSION_STRING
-#define APP_VERSION_STRING "0.1.0"
-#endif
-
-#ifndef APP_VERSION_WSTRING
-#define APP_VERSION_WSTRING L"0.1.0"
-#endif
+#include "app_version.h"
 
 extern nlohmann::json config;
 extern std::string windowTitle;
